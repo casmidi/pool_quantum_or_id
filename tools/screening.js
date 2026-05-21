@@ -103,11 +103,12 @@ function recordProviderFailure(provider) {
 
 /**
  * Wrap a single OKX endpoint call with per-endpoint circuit tracking.
- * Returns null (fulfilled) when circuit is open — callers treat this the same
- * as a failed fetch, without adding noise to logs.
+ * Returns { _skipped: true, endpointKey } (fulfilled) when circuit is open,
+ * allowing callers to distinguish circuit-open skips from real API failures
+ * in telemetry without adding per-call log noise.
  */
 async function callOkxEndpoint(endpointKey, fn) {
-  if (isCircuitOpen(endpointKey)) return null; // silently skip — circuit already logged on open
+  if (isCircuitOpen(endpointKey)) return { _skipped: true, endpointKey }; // circuit already logged on open
   try {
     const result = await fn();
     recordProviderSuccess(endpointKey);
@@ -116,6 +117,17 @@ async function callOkxEndpoint(endpointKey, fn) {
     recordProviderFailure(endpointKey);
     throw err; // re-throw so Promise.allSettled records status "rejected"
   }
+}
+
+/**
+ * Unwrap an OKX settled result into a plain value or null.
+ * Treats both API failures (status "rejected") and circuit-open skips
+ * ({ _skipped: true }) as null, keeping consumer logic uniform.
+ */
+function okxResult(settled, fallback = null) {
+  if (settled.status !== "fulfilled") return fallback;
+  if (settled.value?._skipped) return fallback;
+  return settled.value ?? fallback;
 }
 
 // ── OKX per-mint cache — TTL 5 min — avoids re-enriching same mint every cycle ──
@@ -131,10 +143,11 @@ function getOkxCached(mint) {
 
 function setOkxCached(mint, data) {
   if (_okxCache.size >= OKX_CACHE_MAX) {
-    // Lazy sweep: evict any expired entry before falling back to oldest-entry eviction
+    // Lazy sweep: delete ALL expired entries before falling back to oldest-entry eviction —
+    // prevents stale entries accumulating when cache is near capacity
     const now = Date.now();
     for (const [k, v] of _okxCache) {
-      if (now - v.ts >= OKX_CACHE_TTL_MS) { _okxCache.delete(k); break; }
+      if (now - v.ts >= OKX_CACHE_TTL_MS) _okxCache.delete(k);
     }
     if (_okxCache.size >= OKX_CACHE_MAX) _okxCache.delete(_okxCache.keys().next().value);
   }
@@ -496,10 +509,10 @@ async function cachedSearchAssetsBySymbol(symbol) {
   if (entry && Date.now() - entry.ts < PVP_SYMBOL_CACHE_TTL_MS) return entry.assets;
   const assets = await searchAssetsBySymbol(symbol).catch(() => []);
   if (_pvpSymbolCache.size >= PVP_SYMBOL_CACHE_MAX) {
-    // Lazy sweep: prefer evicting an expired entry over the oldest live one
+    // Lazy sweep: delete ALL expired entries before falling back to oldest-entry eviction
     const now = Date.now();
     for (const [k, v] of _pvpSymbolCache) {
-      if (now - v.ts >= PVP_SYMBOL_CACHE_TTL_MS) { _pvpSymbolCache.delete(k); break; }
+      if (now - v.ts >= PVP_SYMBOL_CACHE_TTL_MS) _pvpSymbolCache.delete(k);
     }
     if (_pvpSymbolCache.size >= PVP_SYMBOL_CACHE_MAX) {
       _pvpSymbolCache.delete(_pvpSymbolCache.keys().next().value);
@@ -823,6 +836,14 @@ export async function getTopCandidates({ limit = 10 } = {}) {
   // so a single unstable endpoint doesn't kill the rest of the OKX layer.
   if (eligible.length > 0) {
     const { getAdvancedInfo, getPriceInfo, getClusterList, getRiskFlags } = await import("./okx.js");
+
+    // One-per-cycle observability log for open circuits — lets operators see partial degradation
+    // without flooding logs with per-pool entries
+    const openCircuits = ["okx:advanced", "okx:price", "okx:cluster", "okx:risk"].filter(isCircuitOpen);
+    if (openCircuits.length > 0) {
+      log("okx", `Partial degradation this cycle: circuits open for [${openCircuits.join(", ")}]`);
+    }
+
     const okxResults = await mapWithConcurrency(eligible, 5, async (p) => {
       if (!p.base?.mint) return { adv: null, price: null, clusters: [], risk: null };
 
@@ -838,16 +859,19 @@ export async function getTopCandidates({ limit = 10 } = {}) {
       ]);
 
       const mintShort = p.base.mint.slice(0, 8);
+      // Log only real API failures; circuit-open skips are already noted at cycle level above
       if (adv.status !== "fulfilled")      log("okx", `advanced-info unavailable for ${p.name} (${mintShort})`);
       if (price.status !== "fulfilled")    log("okx", `price-info unavailable for ${p.name} (${mintShort})`);
       if (clusters.status !== "fulfilled") log("okx", `cluster-list unavailable for ${p.name} (${mintShort})`);
       if (risk.status !== "fulfilled")     log("okx", `risk-check unavailable for ${p.name} (${mintShort})`);
 
+      // okxResult() unwraps settled values — treats circuit-skipped ({ _skipped:true }) and
+      // API failures (rejected) uniformly as null, keeping consumer logic identical in both cases
       const result = {
-        adv: adv.status === "fulfilled" ? adv.value : null,
-        price: price.status === "fulfilled" ? price.value : null,
-        clusters: clusters.status === "fulfilled" ? clusters.value : [],
-        risk: risk.status === "fulfilled" ? risk.value : null,
+        adv:      okxResult(adv),
+        price:    okxResult(price),
+        clusters: okxResult(clusters, []),
+        risk:     okxResult(risk),
       };
       // Cache only if we received at least some useful data
       if (result.adv || result.price || result.risk) setOkxCached(p.base.mint, result);
