@@ -45,11 +45,66 @@ function normalizeSymbol(symbol) {
 }
 
 function scoreCandidate(pool) {
-  const feeTvl = Number(pool.fee_active_tvl_ratio || 0);
-  const organic = Number(pool.organic_score || 0);
-  const volume = Number(pool.volume_window || 0);
-  const holders = Number(pool.holders || 0);
-  return feeTvl * 1000 + organic * 10 + volume / 100 + holders / 100;
+  const feeTvl    = Number(pool.fee_active_tvl_ratio || 0);
+  const organic   = Number(pool.organic_score || pool.base?.organic || 0);
+  const volume    = Math.log10(Number(pool.volume_window || 0) + 1);
+  const holders   = Math.log10(Number(pool.holders || 0) + 1);
+  const activePct = Number(pool.active_pct || 0);
+  const volatility = Number(pool.volatility || 0);
+
+  let score = 0;
+  score += feeTvl * 1000;
+  score += organic * 3;
+  score += volume * 20;
+  score += holders * 10;
+  score += activePct * 0.5;
+  if (!Number.isFinite(volatility) || volatility <= 0) score -= 100;
+  if (volatility > 20) score -= 50;
+  return score;
+}
+
+// ── Config validator — pastikan nilai numerik tidak undefined/null sebelum query API ──
+function normalizeScreeningConfig(raw) {
+  function req(name, value) {
+    const n = Number(value);
+    if (!Number.isFinite(n)) throw new Error(`Invalid screening config: ${name}=${value}`);
+    return n;
+  }
+  return {
+    ...raw,
+    minMcap:              req("minMcap",              raw.minMcap),
+    maxMcap:              raw.maxMcap  == null ? Infinity : req("maxMcap",  raw.maxMcap),
+    minHolders:           req("minHolders",           raw.minHolders),
+    minVolume:            req("minVolume",             raw.minVolume),
+    minTvl:               req("minTvl",               raw.minTvl),
+    maxTvl:               raw.maxTvl   == null ? null : req("maxTvl",   raw.maxTvl),
+    minBinStep:           req("minBinStep",            raw.minBinStep),
+    maxBinStep:           req("maxBinStep",            raw.maxBinStep),
+    minFeeActiveTvlRatio: req("minFeeActiveTvlRatio",  raw.minFeeActiveTvlRatio),
+    minOrganic:           req("minOrganic",            raw.minOrganic),
+    minQuoteOrganic:      req("minQuoteOrganic",       raw.minQuoteOrganic),
+  };
+}
+
+// ── fetch helper dengan timeout + retry ──────────────────────────────────────
+async function fetchJson(url, { timeoutMs = 8000, retries = 2, headers } = {}) {
+  let lastError;
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const res = await fetch(url, { headers, signal: controller.signal });
+      clearTimeout(timer);
+      if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+      return await res.json();
+    } catch (err) {
+      clearTimeout(timer);
+      lastError = err;
+      if (attempt === retries) break;
+      await new Promise((r) => setTimeout(r, 500 * (attempt + 1)));
+    }
+  }
+  throw lastError;
 }
 
 function numeric(value) {
@@ -127,6 +182,9 @@ function getRawPoolScreeningRejectReason(pool, s) {
   if (feeActiveTvlRatio == null || feeActiveTvlRatio < s.minFeeActiveTvlRatio) {
     return `fee/active-TVL ${feeActiveTvlRatio ?? "unknown"} below minFeeActiveTvlRatio ${s.minFeeActiveTvlRatio}`;
   }
+  if (pool?.volatility_missing) {
+    return `volatility unavailable for required timeframe ${pool.volatility_timeframe ?? MIN_VOLATILITY_TIMEFRAME}`;
+  }
   if (!isUsableVolatility(volatility)) {
     return `volatility ${volatility ?? "unknown"} is unusable`;
   }
@@ -136,14 +194,11 @@ function getRawPoolScreeningRejectReason(pool, s) {
   if (quoteOrganic == null || quoteOrganic < s.minQuoteOrganic) {
     return `quote organic ${quoteOrganic ?? "unknown"} below minQuoteOrganic ${s.minQuoteOrganic}`;
   }
-  if (
-    pool?.discord_signal &&
-    Array.isArray(s.allowedLaunchpads) &&
-    s.allowedLaunchpads.length > 0 &&
-    launchpad &&
-    !includesCaseInsensitive(s.allowedLaunchpads, launchpad)
-  ) {
-    return `launchpad ${launchpad} not in allow-list`;
+  if (Array.isArray(s.allowedLaunchpads) && s.allowedLaunchpads.length > 0) {
+    if (!launchpad) return "launchpad unknown while allow-list is enabled";
+    if (!includesCaseInsensitive(s.allowedLaunchpads, launchpad)) {
+      return `launchpad ${launchpad} not in allow-list`;
+    }
   }
   if (includesCaseInsensitive(s.blockedLaunchpads, launchpad)) {
     return `blocked launchpad (${launchpad})`;
@@ -160,11 +215,10 @@ function getRawPoolScreeningRejectReason(pool, s) {
 }
 
 async function fetchDiscordSignalCandidates() {
-  const res = await fetch(`${getAgentMeridianBase()}/signals/discord/candidates`, {
-    headers: getAgentMeridianHeaders(),
-  });
-  if (!res.ok) throw new Error(`discord signal candidates ${res.status}`);
-  const data = await res.json();
+  const data = await fetchJson(
+    `${getAgentMeridianBase()}/signals/discord/candidates`,
+    { headers: getAgentMeridianHeaders() }
+  );
   return Array.isArray(data?.candidates) ? data.candidates : [];
 }
 
@@ -173,30 +227,20 @@ async function fetchPoolDiscoveryPage({ page_size, filters, timeframe, category 
     `page_size=${page_size}` +
     `&filter_by=${encodeURIComponent(filters)}` +
     `&timeframe=${timeframe}` +
-    `&category=${category}`;
+    (category ? `&category=${category}` : "");
 
-  const res = await fetch(url);
-
-  if (!res.ok) {
-    throw new Error(`Pool Discovery API error: ${res.status} ${res.statusText}`);
-  }
-
-  return res.json();
+  return fetchJson(url);
 }
 
-async function fetchPoolDiscoveryDetail({ poolAddress, timeframe }) {
+async function fetchPoolDiscoveryDetail({ poolAddress, timeframe, category }) {
+  const cat = category ?? config.screening.category;
   const url = `${POOL_DISCOVERY_BASE}/pools?` +
     `page_size=1` +
     `&filter_by=${encodeURIComponent(`pool_address=${poolAddress}`)}` +
-    `&timeframe=${timeframe}`;
+    `&timeframe=${timeframe}` +
+    (cat ? `&category=${cat}` : "");
 
-  const res = await fetch(url);
-
-  if (!res.ok) {
-    throw new Error(`Pool detail API error: ${res.status} ${res.statusText}`);
-  }
-
-  const data = await res.json();
+  const data = await fetchJson(url);
   return (data.data || [])[0] ?? null;
 }
 
@@ -226,18 +270,23 @@ async function applyVolatilityTimeframe(rawPools, sourceTimeframe) {
   }
 
   for (const pool of rawPools) {
-    if (!pool?.pool_address || !volatilityByPool.has(pool.pool_address)) continue;
-    pool.volatility = volatilityByPool.get(pool.pool_address);
-    pool.volatility_timeframe = volatilityTimeframe;
+    if (!pool?.pool_address) continue;
+    if (volatilityByPool.has(pool.pool_address)) {
+      pool.volatility = volatilityByPool.get(pool.pool_address);
+      pool.volatility_timeframe = volatilityTimeframe;
+    } else {
+      // Fetch failed — null volatility so filter rejects it, never silently use short-timeframe data
+      pool.volatility = null;
+      pool.volatility_timeframe = volatilityTimeframe;
+      pool.volatility_missing = true;
+    }
   }
 
   return rawPools;
 }
 
 async function searchAssetsBySymbol(symbol) {
-  const res = await fetch(`${DATAPI_JUP}/assets/search?query=${encodeURIComponent(symbol)}`);
-  if (!res.ok) throw new Error(`assets/search ${res.status}`);
-  const data = await res.json();
+  const data = await fetchJson(`${DATAPI_JUP}/assets/search?query=${encodeURIComponent(symbol)}`);
   return Array.isArray(data) ? data : [data];
 }
 
@@ -291,9 +340,7 @@ async function enrichDiscordSignalLaunchpads(rawPools) {
 
 async function findRivalPool(mint) {
   const url = `https://dlmm.datapi.meteora.ag/pools?query=${encodeURIComponent(mint)}&sort_by=${encodeURIComponent("tvl:desc")}&filter_by=${encodeURIComponent(`tvl>${PVP_MIN_ACTIVE_TVL}`)}`;
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`rival pool search ${res.status}`);
-  const data = await res.json();
+  const data = await fetchJson(url);
   const pools = Array.isArray(data?.data) ? data.data : [];
   return pools.find((pool) => pool?.token_x?.address === mint || pool?.token_y?.address === mint) || null;
 }
@@ -355,7 +402,7 @@ async function enrichPvpRisk(pools) {
 export async function discoverPools({
   page_size = 50,
 } = {}) {
-  const s = config.screening;
+  const s = normalizeScreeningConfig(config.screening);
   const filters = [
     "base_token_has_critical_warnings=false",
     "quote_token_has_critical_warnings=false",
@@ -681,6 +728,48 @@ export async function getTopCandidates({ limit = 10 } = {}) {
     });
     eligible.splice(0, eligible.length, ...filtered);
     if (eligible.length < before) log("dev_blocklist", `Filtered ${before - eligible.length} pool(s) via OKX creator check`);
+
+    // ── Hard risk filters (OKX enriched fields) ─────────────────────────────
+    const maxBundle     = Number(config.screening.maxBundlePct     ?? 30);
+    const maxSniper     = Number(config.screening.maxSniperPct     ?? 30);
+    const maxSuspicious = Number(config.screening.maxSuspiciousPct ?? 30);
+    const riskBefore    = eligible.length;
+    eligible.splice(0, eligible.length, ...eligible.filter((p) => {
+      if (p.is_rugpull) {
+        log("screening", `Risk filter: dropped ${p.name} — flagged as rugpull`);
+        pushFilteredReason(filteredOut, p, "flagged as rugpull");
+        return false;
+      }
+      if (p.risk_level === "high") {
+        log("screening", `Risk filter: dropped ${p.name} — risk_level high`);
+        pushFilteredReason(filteredOut, p, "risk_level high");
+        return false;
+      }
+      if (Number.isFinite(Number(p.bundle_pct)) && Number(p.bundle_pct) > maxBundle) {
+        log("screening", `Risk filter: dropped ${p.name} — bundle_pct ${p.bundle_pct} > ${maxBundle}`);
+        pushFilteredReason(filteredOut, p, `bundle_pct ${p.bundle_pct} > limit ${maxBundle}`);
+        return false;
+      }
+      if (Number.isFinite(Number(p.sniper_pct)) && Number(p.sniper_pct) > maxSniper) {
+        log("screening", `Risk filter: dropped ${p.name} — sniper_pct ${p.sniper_pct} > ${maxSniper}`);
+        pushFilteredReason(filteredOut, p, `sniper_pct ${p.sniper_pct} > limit ${maxSniper}`);
+        return false;
+      }
+      if (Number.isFinite(Number(p.suspicious_pct)) && Number(p.suspicious_pct) > maxSuspicious) {
+        log("screening", `Risk filter: dropped ${p.name} — suspicious_pct ${p.suspicious_pct} > ${maxSuspicious}`);
+        pushFilteredReason(filteredOut, p, `suspicious_pct ${p.suspicious_pct} > limit ${maxSuspicious}`);
+        return false;
+      }
+      if (p.dev_sold_all === true && config.screening.blockDevSoldAll) {
+        log("screening", `Risk filter: dropped ${p.name} — dev sold all tokens`);
+        pushFilteredReason(filteredOut, p, "dev sold all tokens");
+        return false;
+      }
+      return true;
+    }));
+    if (eligible.length < riskBefore) {
+      log("screening", `Hard risk filter removed ${riskBefore - eligible.length} pool(s)`);
+    }
   }
 
   if (config.indicators.enabled && eligible.length > 0) {
@@ -693,11 +782,14 @@ export async function getTopCandidates({ limit = 10 } = {}) {
           });
           return { pool: pool.pool, confirmation };
         } catch (error) {
+          // failOpenOnError: true  → let pool through when indicator service is down (permissive)
+          // failOpenOnError: false → reject pool when indicator service is down (safe default for live)
+          const failOpen = config.indicators?.failOpenOnError ?? false;
           return {
             pool: pool.pool,
             confirmation: {
               enabled: true,
-              confirmed: true,
+              confirmed: failOpen,
               skipped: true,
               reason: `Indicator confirmation unavailable: ${error.message}`,
               intervals: [],
@@ -747,10 +839,17 @@ export async function getTopCandidates({ limit = 10 } = {}) {
     });
   }
 
+  const debugLimit = Number(config.screening.filteredExamplesLimit ?? 20);
+  const filterSummary = filteredOut.reduce((acc, item) => {
+    acc[item.reason] = (acc[item.reason] || 0) + 1;
+    return acc;
+  }, {});
+
   return {
     candidates: eligible,
     total_screened: pools.length,
-    filtered_examples: filteredOut.slice(0, 3),
+    filtered_examples: filteredOut.slice(0, debugLimit),
+    filter_summary: filterSummary,
   };
 }
 
