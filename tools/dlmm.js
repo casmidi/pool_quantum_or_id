@@ -80,6 +80,9 @@ let _wallet = null;
 
 function getConnection() {
   if (!_connection) {
+    if (!process.env.RPC_URL) {
+      throw new Error("RPC_URL not set — cannot create Solana connection. Check your .env file.");
+    }
     _connection = new Connection(process.env.RPC_URL, "confirmed");
   }
   return _connection;
@@ -483,6 +486,9 @@ export async function deployPosition({
   }
 
   const { StrategyType, getBinIdFromPrice, getPriceOfBinByBinId } = await getDLMM();
+  // P2: Always fetch fresh pool object for deploy — stale SDK state could hold
+  // outdated active-bin or price data from up to 5 minutes ago.
+  poolCache.delete(pool_address);
   const pool = await getPool(pool_address);
   const baseMint = pool.lbPair.tokenXMint.toString();
   if (isBaseMintOnCooldown(baseMint)) {
@@ -604,6 +610,16 @@ export async function deployPosition({
   }
 
   const isWideRange = totalBins > 69;
+
+  // P1: Deploy slippage configurable and capped at 500 bps (5%).
+  // Default 300 bps (3%) — enough for single-side SOL into an existing pool.
+  // 1000 bps (10%) was too loose; validate before clamp to catch NaN configs.
+  const _rawDeploySlippage = Number(config.management?.deploySlippageBps ?? 300);
+  if (!Number.isFinite(_rawDeploySlippage)) {
+    throw new Error("Invalid deploySlippageBps — must be a finite number.");
+  }
+  const deploySlippageBps = Math.min(Math.max(1, _rawDeploySlippage), 500);
+
   const minBinId = activeBin.binId - activeBinsBelow;
   const maxBinId = isSingleSidedSol ? activeBin.binId : activeBin.binId + activeBinsAbove;
 
@@ -808,7 +824,7 @@ export async function deployPosition({
         totalXAmount: totalXLamports,
         totalYAmount: totalYLamports,
         strategy: { minBinId, maxBinId, strategyType },
-        slippage: 1000, // 10% in bps — same unit as standard path
+        slippage: deploySlippageBps,
       });
       const addTxArray = Array.isArray(addTxs) ? addTxs : [addTxs];
       for (let i = 0; i < addTxArray.length; i++) {
@@ -824,7 +840,7 @@ export async function deployPosition({
         totalXAmount: totalXLamports,
         totalYAmount: totalYLamports,
         strategy: { maxBinId, minBinId, strategyType },
-        slippage: 1000, // 10% in bps
+        slippage: deploySlippageBps,
       });
       const txHash = await sendAndConfirmTransaction(getConnection(), tx, [wallet, newPosition]);
       txHashes.push(txHash);
@@ -1179,11 +1195,14 @@ export async function getMyPositions({ force = false, silent = false } = {}) {
         const ageFromState = tracked?.deployed_at
           ? Math.floor((Date.now() - new Date(tracked.deployed_at).getTime()) / 60000)
           : null;
-        const reportedPnlPct = lpData
-          ? parseFloat(config.management.solMode ? (lpData.pnl?.percentNative || 0) : (lpData.pnl?.percent || 0))
+        // P2: Use null (not 0) when API doesn't send percent — prevents hiding real loss/gain
+        // as zero and corrupting PnL sanity check (pnlPctDiff would always be 0 vs derived).
+        const _rawReportedPct = lpData
+          ? (config.management.solMode ? lpData.pnl?.percentNative : lpData.pnl?.percent)
           : binData
-            ? parseFloat(config.management.solMode ? (binData.pnlSolPctChange || 0) : (binData.pnlPctChange || 0))
+            ? (config.management.solMode ? binData.pnlSolPctChange : binData.pnlPctChange)
             : null;
+        const reportedPnlPct = _rawReportedPct == null ? null : parseFloat(_rawReportedPct);
         const derivedPnlPct = lpData
           ? deriveLpAgentPnlPct(lpData, config.management.solMode)
           : binData
@@ -1283,6 +1302,9 @@ export async function getMyPositions({ force = false, silent = false } = {}) {
           age_minutes:        binData?.createdAt ? Math.floor((Date.now() - binData.createdAt * 1000) / 60000) : ageFromState,
           minutes_out_of_range: minutesOutOfRange(positionAddress),
           instruction:        tracked?.instruction ?? null,
+          // P2: data_quality flag — manager should avoid automated close/hold decisions
+          // when only portfolio data is available (missing lower_bin, upper_bin, pnl_pct).
+          data_quality:       binData ? "complete" : "portfolio_only",
         });
       }
     }
@@ -1445,8 +1467,19 @@ export async function closePosition({ position_address, reason }) {
       ];
       const livePositions = await getMyPositions({ force: true, silent: true });
       const livePosition = livePositions?.positions?.find((position) => position.position === position_address);
-      const closeFromBinId = livePosition?.lower_bin ?? tracked?.bin_range?.min ?? -887272;
-      const closeToBinId = livePosition?.upper_bin ?? tracked?.bin_range?.max ?? 887272;
+      // P1: Refuse relay close if bin range is completely unknown — extreme fallback
+      // (-887272/887272) could cause the relay to generate a dangerously wide transaction.
+      const _relayFromBin = livePosition?.lower_bin ?? tracked?.bin_range?.min;
+      const _relayToBin   = livePosition?.upper_bin ?? tracked?.bin_range?.max;
+      if (_relayFromBin == null || _relayToBin == null) {
+        throw new Error(
+          `Cannot close safely via relay: bin range unknown for position ${position_address.slice(0, 8)}. ` +
+          `Neither live portfolio nor state registry has lower/upper bin. ` +
+          `Try closing manually or wait for portfolio API to sync.`
+        );
+      }
+      const closeFromBinId = _relayFromBin;
+      const closeToBinId   = _relayToBin;
       // P1: Determine close output based on which token is SOL — not hard-coded to token1.
       // allToken0 if tokenX is SOL, allToken1 if tokenY is SOL.
       const _closeTokenXMint = pool.lbPair.tokenXMint.toString();
@@ -1465,14 +1498,13 @@ export async function closePosition({ position_address, reason }) {
       }
 
       // P0: Cap relay close slippage at 500 bps (5%) max — 5000 bps (50%) is dangerously high.
+      // P1: Validate before clamp so NaN config is caught before Math.min/max silently passes NaN.
       // Configurable via config.management.closeSlippageBps, default 300 bps (3%).
-      const closeSlippageBps = Math.min(
-        Math.max(1, Number(config.management?.closeSlippageBps ?? 300)),
-        500
-      );
-      if (!Number.isFinite(closeSlippageBps)) {
+      const _rawCloseSlippageBps = Number(config.management?.closeSlippageBps ?? 300);
+      if (!Number.isFinite(_rawCloseSlippageBps)) {
         throw new Error("Invalid closeSlippageBps — must be a finite number.");
       }
+      const closeSlippageBps = Math.min(Math.max(1, _rawCloseSlippageBps), 500);
 
       const order = await agentMeridianJson("/execution/zap-out/order", {
         method: "POST",
@@ -1679,7 +1711,19 @@ export async function closePosition({ position_address, reason }) {
         base_mint: livePosition?.base_mint || null,
       };
       } catch (relayError) {
-        if (relaySubmitted) throw relayError;
+        if (relaySubmitted) {
+          // P3: Error occurred after relay was already submitted — don't rethrow into
+          // the outer catch (which would return success:false) and don't fall through
+          // to local close (which would attempt a duplicate close on-chain).
+          log("close_warn", `Error after relay submit: ${relayError.message}`);
+          return {
+            success: null,
+            status: "submitted_error_after_submit",
+            warning: `Close tx was submitted but an error occurred after: ${relayError.message}`,
+            position: position_address,
+            pool: poolAddress,
+          };
+        }
         log("close_warn", `Relay zap-out failed before submit; falling back to local close + Jupiter autoswap: ${relayError.message}`);
       }
     }
