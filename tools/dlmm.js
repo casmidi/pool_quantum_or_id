@@ -28,6 +28,9 @@ import { isBaseMintOnCooldown, isPoolOnCooldown } from "../pool-memory.js";
 import { normalizeMint, getWalletBalances } from "./wallet.js";
 import { appendDecision } from "../decision-log.js";
 import { agentMeridianJson, getAgentIdForRequests, getAgentMeridianHeaders } from "./agent-meridian.js";
+import fs from "fs";
+import path from "path";
+import { fileURLToPath } from "url";
 
 // ─── Lazy SDK loader ───────────────────────────────────────────
 // @meteora-ag/dlmm → @coral-xyz/anchor uses CJS directory imports
@@ -624,7 +627,8 @@ export async function deployPosition({
       error: "Deploy already in progress for this pool — wait for current deploy to complete.",
     };
   }
-  _deployPending.add(pool_address);
+  _deployPending.set(pool_address, Date.now());
+  _savePendingState();
   try {
 
   const isWideRange = totalBins > 69;
@@ -934,6 +938,7 @@ export async function deployPosition({
 
   } finally {
     _deployPending.delete(pool_address);
+    _savePendingState();
   }
 }
 
@@ -945,10 +950,57 @@ let _positionsCache = null;
 let _positionsCacheAt = 0;
 let _positionsInflight = null; // deduplicates concurrent calls
 
-// P2: In-memory pending operation guards — prevent race-condition double-deploy/double-close
-// within the same process. Not persistent across restarts, but covers the common live case.
-const _deployPending = new Set(); // pool_address currently being deployed
-const _closePending  = new Set(); // position_address currently being closed
+// P1: Pending operation guards — prevent race-condition double-deploy/double-close.
+// Stored as Map<address, timestamp> and persisted to pending_operations.json so the guard
+// survives PM2 restart, VPS reboot, or Node crash. Entries auto-expire after 30 minutes
+// (covers the longest realistic transaction confirmation window on Solana).
+const __pendingDir   = path.dirname(fileURLToPath(import.meta.url));
+const PENDING_STATE_FILE = path.join(__pendingDir, "..", "pending_operations.json");
+const PENDING_TTL_MS = 30 * 60 * 1000; // 30 minutes
+
+const _deployPending = new Map(); // pool_address → started_at timestamp
+const _closePending  = new Map(); // position_address → started_at timestamp
+
+function _savePendingState() {
+  try {
+    const state = {
+      deploy:  Object.fromEntries(_deployPending),
+      close:   Object.fromEntries(_closePending),
+      updated: Date.now(),
+    };
+    fs.writeFileSync(PENDING_STATE_FILE, JSON.stringify(state, null, 2), "utf8");
+  } catch (e) {
+    log("pending_state_warn", `Failed to save pending state: ${e.message}`);
+  }
+}
+
+function _loadPendingState() {
+  try {
+    if (!fs.existsSync(PENDING_STATE_FILE)) return;
+    const raw = JSON.parse(fs.readFileSync(PENDING_STATE_FILE, "utf8"));
+    const now = Date.now();
+    let loaded = 0;
+    for (const [pool, ts] of Object.entries(raw.deploy || {})) {
+      if (now - Number(ts) < PENDING_TTL_MS) {
+        _deployPending.set(pool, Number(ts));
+        loaded++;
+      }
+    }
+    for (const [pos, ts] of Object.entries(raw.close || {})) {
+      if (now - Number(ts) < PENDING_TTL_MS) {
+        _closePending.set(pos, Number(ts));
+        loaded++;
+      }
+    }
+    if (loaded > 0) {
+      log("pending_state", `Loaded ${loaded} persisted pending op(s) from pending_operations.json — will block re-deploy/re-close for up to 30 min.`);
+    }
+  } catch (e) {
+    log("pending_state_warn", `Failed to load pending state: ${e.message}`);
+  }
+}
+_loadPendingState();
+
 const LPAGENT_API = "https://api.lpagent.io/open-api/v1";
 
 async function fetchLpAgentOpenPositions(walletAddress) {
@@ -1488,7 +1540,8 @@ export async function closePosition({ position_address, reason }) {
       error: "Close already in progress for this position — wait for current close to complete.",
     };
   }
-  _closePending.add(position_address);
+  _closePending.set(position_address, Date.now());
+  _savePendingState();
 
   try {
     log("close", `Closing position: ${position_address}`);
@@ -1550,7 +1603,7 @@ export async function closePosition({ position_address, reason }) {
         headers: getAgentMeridianHeaders({ json: true }),
         body: JSON.stringify({
           agentId: getAgentIdForRequests(),
-          idempotencyKey: `close:${position_address}:10000`,
+          idempotencyKey: `close:${position_address}:${Date.now()}`,
           positionId: position_address,
           owner: wallet.publicKey.toString(),
           bps: 10000,
@@ -2049,6 +2102,7 @@ export async function closePosition({ position_address, reason }) {
     return { success: false, error: error.message };
   } finally {
     _closePending.delete(position_address);
+    _savePendingState();
   }
 }
 
