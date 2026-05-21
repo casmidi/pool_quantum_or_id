@@ -7,7 +7,7 @@ import { agentLoop } from "./agent.js";
 import { log } from "./logger.js";
 import { getMyPositions, closePosition, getActiveBin } from "./tools/dlmm.js";
 import { getWalletBalances } from "./tools/wallet.js";
-import { getTopCandidates } from "./tools/screening.js";
+import { getTopCandidates, shutdownScreening } from "./tools/screening.js";
 import { config, reloadScreeningThresholds, computeDeployAmount } from "./config.js";
 import { evolveThresholds, getPerformanceSummary } from "./lessons.js";
 import { executeTool, registerCronRestarter } from "./tools/executor.js";
@@ -973,6 +973,7 @@ async function shutdown(signal) {
   _shuttingDown = true;
 
   log("shutdown", `Received ${signal}. Shutting down...`);
+  shutdownScreening(); // clear periodic cache sweep timer
   stopPolling();
   stopCronJobs();
 

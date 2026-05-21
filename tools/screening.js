@@ -525,13 +525,21 @@ async function cachedSearchAssetsBySymbol(symbol) {
 // ── Periodic background cache sweep ──────────────────────────────────────────
 // Insert-triggered lazy sweep only runs during active screening.  This timer
 // catches expired entries in low-traffic windows (e.g. overnight, idle cycles).
-// Singleton guard (globalThis flag) prevents duplicate timers if the module is
-// hot-reloaded, imported in a test harness, or re-evaluated in any context.
+//
+// Singleton guard uses Symbol.for() — a global symbol registry that survives
+// module re-evaluations, hot-reloads, and test-harness re-imports within the
+// same process.  Safer than a plain string key because Symbol.for() is
+// namespace-scoped by convention and cannot collide with string properties.
+//
 // .unref() ensures the timer never prevents the process from exiting cleanly.
-if (!globalThis.__meridian_screeningCacheSweepStarted) {
-  globalThis.__meridian_screeningCacheSweepStarted = true;
+// shutdownScreening() (exported below) provides an explicit teardown hook for
+// graceful-shutdown callers (e.g. SIGTERM handler in index.js).
+const _SWEEP_SINGLETON = Symbol.for("meridian.screening.cacheSweep");
+let _cacheSweepTimer = null;
+if (!globalThis[_SWEEP_SINGLETON]) {
+  globalThis[_SWEEP_SINGLETON] = true;
   const CACHE_SWEEP_INTERVAL_MS = 5 * 60 * 1000; // every 5 minutes
-  setInterval(() => {
+  _cacheSweepTimer = setInterval(() => {
     const now = Date.now();
     let okxEvicted = 0;
     for (const [k, v] of _okxCache) {
@@ -545,6 +553,21 @@ if (!globalThis.__meridian_screeningCacheSweepStarted) {
       log("screening", `Periodic cache sweep: evicted ${okxEvicted} OKX + ${pvpEvicted} PVP expired entries`);
     }
   }, CACHE_SWEEP_INTERVAL_MS).unref();
+}
+
+/**
+ * Gracefully tear down the periodic cache sweep timer.
+ * Call this from your SIGTERM/SIGINT handler in index.js so the timer is
+ * cleared before the process exits — avoids any last-tick sweep log noise
+ * and releases the interval ref cleanly.
+ */
+export function shutdownScreening() {
+  if (_cacheSweepTimer) {
+    clearInterval(_cacheSweepTimer);
+    _cacheSweepTimer = null;
+  }
+  // Reset singleton so a future re-import (e.g. in tests) can restart the timer
+  globalThis[_SWEEP_SINGLETON] = false;
 }
 
 async function enrichPvpRisk(pools, { limit = pools.length } = {}) {
