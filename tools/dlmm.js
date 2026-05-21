@@ -619,7 +619,8 @@ export async function deployPosition({
     };
   }
 
-  // P2: Deploy pending lock — prevents duplicate deploy to same pool in concurrent calls.
+  // P1: Deploy pending lock — prevents duplicate deploy to same pool in concurrent calls.
+  // Persisted to pending_operations.json so the guard also survives restart.
   // Runs after DRY_RUN so dry-run simulations are never blocked.
   if (_deployPending.has(pool_address)) {
     return {
@@ -968,7 +969,12 @@ function _savePendingState() {
       close:   Object.fromEntries(_closePending),
       updated: Date.now(),
     };
-    fs.writeFileSync(PENDING_STATE_FILE, JSON.stringify(state, null, 2), "utf8");
+    // P1: Atomic write — write to .tmp then rename so a mid-write crash
+    // (VPS reboot, OOM kill) cannot corrupt the live pending_operations.json.
+    // rename() is atomic on NTFS and ext4.
+    const tmp = PENDING_STATE_FILE + ".tmp";
+    fs.writeFileSync(tmp, JSON.stringify(state, null, 2), "utf8");
+    fs.renameSync(tmp, PENDING_STATE_FILE);
   } catch (e) {
     log("pending_state_warn", `Failed to save pending state: ${e.message}`);
   }
@@ -1532,7 +1538,8 @@ export async function closePosition({ position_address, reason }) {
 
   const tracked = getTrackedPosition(position_address);
 
-  // P1/P2: Close pending lock — prevents duplicate close attempt to same position.
+  // P1: Close pending lock — prevents duplicate close attempt to same position.
+  // Persisted to pending_operations.json so the guard also survives restart.
   // Returns early if another close is already in flight (e.g. management cycle overlap).
   if (_closePending.has(position_address)) {
     return {
