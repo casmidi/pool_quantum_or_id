@@ -37,7 +37,9 @@ if (u.walletKey) process.env.WALLET_PRIVATE_KEY ||= u.walletKey;
 if (u.llmModel)  process.env.LLM_MODEL          ||= u.llmModel;
 if (u.llmBaseUrl) process.env.LLM_BASE_URL      ||= u.llmBaseUrl;
 if (u.llmApiKey)  process.env.LLM_API_KEY       ||= u.llmApiKey;
-if (u.dryRun !== undefined) process.env.DRY_RUN ||= String(u.dryRun);
+// Gunakan = bukan ||=: string "false" adalah truthy sehingga ||= tidak override.
+// user-config.json harus selalu menang atas .env untuk setting dryRun.
+if (u.dryRun !== undefined) process.env.DRY_RUN = String(u.dryRun);
 if (u.publicApiKey) process.env.PUBLIC_API_KEY ||= u.publicApiKey;
 if (u.agentMeridianApiUrl) process.env.AGENT_MERIDIAN_API_URL ||= u.agentMeridianApiUrl;
 
@@ -53,11 +55,20 @@ function nonEmptyString(...values) {
 }
 
 export const config = {
+  // ─── Mode ────────────────────────────────
+  // process.env.DRY_RUN sudah disync dari u.dryRun di atas, jadi cukup baca env var.
+  // Fallback false (live mode) jika tidak ada konfigurasi sama sekali.
+  dryRun: u.dryRun !== undefined ? Boolean(u.dryRun) : (process.env.DRY_RUN === "true"),
+  dryRunWallet: numericConfig(u.dry_run_wallet ?? u.dryRunWallet ?? process.env.DRY_RUN_WALLET),
+
   // ─── Risk Limits ─────────────────────────
   risk: {
     maxPositions:    u.maxPositions    ?? 3,
     maxDeployAmount: u.maxDeployAmount ?? 50,
   },
+
+  // ─── Manual Approval ─────────────────────
+  requireApproval: u.requireApproval ?? false,
 
   // ─── Pool Screening Thresholds ───────────
   screening: {
@@ -209,20 +220,24 @@ export const config = {
  * Compute the optimal deploy amount for a given wallet balance.
  * Scales position size with wallet growth (compounding).
  *
- * Formula: clamp(deployable × positionSizePct, floor=deployAmountSol, ceil=maxDeployAmount)
+ * Formula: if wallet < floor + reserve return 0, otherwise
+ * clamp(deployable × positionSizePct, floor=deployAmountSol, ceil=maxDeployAmount)
  *
  * Examples (defaults: gasReserve=0.2, positionSizePct=0.35, floor=0.5):
- *   0.8 SOL wallet → 0.6 SOL deploy  (floor)
+ *   0.7 SOL wallet → 0 SOL deploy    (reserve protected)
+ *   0.8 SOL wallet → 0.5 SOL deploy  (floor)
  *   2.0 SOL wallet → 0.63 SOL deploy
  *   3.0 SOL wallet → 0.98 SOL deploy
  *   4.0 SOL wallet → 1.33 SOL deploy
  */
 export function computeDeployAmount(walletSol) {
+  const wallet   = Number(walletSol);
   const reserve  = config.management.gasReserve      ?? 0.2;
   const pct      = config.management.positionSizePct ?? 0.35;
   const floor    = config.management.deployAmountSol;
   const ceil     = config.risk.maxDeployAmount;
-  const deployable = Math.max(0, walletSol - reserve);
+  if (!Number.isFinite(wallet) || wallet < floor + reserve) return 0;
+  const deployable = Math.max(0, wallet - reserve);
   const dynamic    = deployable * pct;
   const result     = Math.min(ceil, Math.max(floor, dynamic));
   return parseFloat(result.toFixed(2));

@@ -41,3 +41,13 @@ discord-signals.json
 
 # Claude Code runtime lock
 .claude/scheduled_tasks.lock
+
+# Runtime data (pnl logs, dry-run state)
+data/
+
+# Backtest raw data & results
+backtest/history/
+backtest/results/
+
+# Windows artifact
+nul

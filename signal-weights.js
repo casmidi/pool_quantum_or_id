@@ -306,6 +306,28 @@ export function getWeightsSummary() {
   return lines.join("\n");
 }
 
+/** Return raw weights object (for external consumers). */
+export function getWeights() {
+  return loadWeights().weights || { ...DEFAULT_WEIGHTS };
+}
+
+/**
+ * Map signal-weights.json keys → pool-scorer applyDarwinWeights() format.
+ * Allows the Darwinian learning system to influence pool-scorer rankings.
+ */
+export function getDarwinScorerWeights() {
+  const w = getWeights();
+  return {
+    fee_yield_signal:    w.fee_tvl_ratio         ?? 1.0,
+    volume_signal:       w.volume                ?? 1.0,
+    organic_signal:      w.organic_score         ?? 1.0,
+    holder_signal:       w.holder_count          ?? 1.0,
+    smart_money_signal:  w.smart_wallets_present ?? 1.0,
+    discord_signal:      1.0,  // not yet tracked in signal-weights
+    trend_signal:        1.0,  // not yet tracked in signal-weights
+  };
+}
+
 function interpretWeight(val) {
   if (val >= 1.8) return "[STRONG]";
   if (val >= 1.2) return "[above avg]";

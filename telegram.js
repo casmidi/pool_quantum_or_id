@@ -8,6 +8,7 @@ const USER_CONFIG_PATH = path.join(__dirname, "user-config.json");
 
 const TOKEN = process.env.TELEGRAM_BOT_TOKEN || null;
 const BASE  = TOKEN ? `https://api.telegram.org/bot${TOKEN}` : null;
+const PORTAL_LABEL = process.env.TELEGRAM_PORTAL_LABEL || "pool.quantum.or.id";
 const ALLOWED_USER_IDS = new Set(
   String(process.env.TELEGRAM_ALLOWED_USER_IDS || "")
     .split(",")
@@ -83,6 +84,14 @@ export function isEnabled() {
   return !!TOKEN;
 }
 
+function withPortalLabel(text, maxLength = 4096) {
+  const body = String(text ?? "");
+  if (!PORTAL_LABEL) return body.slice(0, maxLength);
+  const prefix = `[${PORTAL_LABEL}]`;
+  if (body.startsWith(prefix)) return body.slice(0, maxLength);
+  return `${prefix}\n\n${body}`.slice(0, maxLength);
+}
+
 async function postTelegram(method, body) {
   if (!TOKEN || !chatId) return null;
   try {
@@ -125,27 +134,27 @@ async function postTelegramRaw(method, body) {
 
 export async function sendMessage(text) {
   if (!TOKEN || !chatId) return;
-  return postTelegram("sendMessage", { text: String(text).slice(0, 4096) });
+  return postTelegram("sendMessage", { text: withPortalLabel(text) });
 }
 
 export async function sendMessageWithButtons(text, inlineKeyboard) {
   if (!TOKEN || !chatId) return;
   return postTelegram("sendMessage", {
-    text: String(text).slice(0, 4096),
+    text: withPortalLabel(text),
     reply_markup: { inline_keyboard: inlineKeyboard },
   });
 }
 
 export async function sendHTML(html) {
   if (!TOKEN || !chatId) return;
-  return postTelegram("sendMessage", { text: html.slice(0, 4096), parse_mode: "HTML" });
+  return postTelegram("sendMessage", { text: withPortalLabel(html), parse_mode: "HTML" });
 }
 
 async function editMessage(text, messageId) {
   if (!TOKEN || !chatId || !messageId) return null;
   return postTelegram("editMessageText", {
     message_id: messageId,
-    text: String(text).slice(0, 4096),
+    text: withPortalLabel(text),
   });
 }
 
@@ -153,7 +162,7 @@ export async function editMessageWithButtons(text, messageId, inlineKeyboard) {
   if (!TOKEN || !chatId || !messageId) return null;
   return postTelegram("editMessageText", {
     message_id: messageId,
-    text: String(text).slice(0, 4096),
+    text: withPortalLabel(text),
     reply_markup: { inline_keyboard: inlineKeyboard },
   });
 }
@@ -164,6 +173,73 @@ export async function answerCallbackQuery(callbackQueryId, text = "") {
     callback_query_id: callbackQueryId,
     ...(text ? { text: String(text).slice(0, 200) } : {}),
   });
+}
+
+// ── Manual approval gate ───────────────────────────────────────────────────
+const _pendingApprovals = new Map(); // id → { resolve, messageId }
+
+export async function requestApproval({ text, timeoutMs = 60_000 }) {
+  if (!TOKEN || !chatId) return { approved: true, reason: "telegram_disabled" };
+
+  const id = `appr_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+  const secs = Math.round(timeoutMs / 1000);
+
+  const fullText = withPortalLabel(`${text}\n\n⏱ Auto-approve dalam ${secs} detik`);
+  const sent = await postTelegram("sendMessage", {
+    text: fullText.slice(0, 4096),
+    parse_mode: "HTML",
+    reply_markup: { inline_keyboard: [[
+      { text: "✅ Deploy", callback_data: `approve:${id}` },
+      { text: "❌ Skip",   callback_data: `reject:${id}`  },
+    ]]},
+  });
+  const sentMsgId = sent?.result?.message_id ?? null;
+
+  return new Promise((resolve) => {
+    const timer = setTimeout(async () => {
+      if (!_pendingApprovals.has(id)) return;
+      _pendingApprovals.delete(id);
+      if (sentMsgId) {
+        const timeoutText = withPortalLabel("✅ <b>Auto-approve</b> — tidak ada respons, melanjutkan deploy");
+        await postTelegram("editMessageText", {
+          message_id: sentMsgId,
+          text: timeoutText.slice(0, 4096),
+          parse_mode: "HTML",
+        }).catch(() => {});
+      }
+      resolve({ approved: true, reason: "timeout_auto_approved" });
+    }, timeoutMs);
+
+    _pendingApprovals.set(id, {
+      resolve: async (approved, callbackQueryId) => {
+        clearTimeout(timer);
+        _pendingApprovals.delete(id);
+        await answerCallbackQuery(callbackQueryId, approved ? "✅ Deploy disetujui" : "❌ Deploy diskip").catch(() => {});
+        if (sentMsgId) {
+          const editedText = withPortalLabel(approved ? "✅ <b>Deploy disetujui</b> — sedang dieksekusi..." : "❌ <b>Deploy diskip</b> oleh pengguna");
+          await postTelegram("editMessageText", {
+            message_id: sentMsgId,
+            text: editedText.slice(0, 4096),
+            parse_mode: "HTML",
+          }).catch(() => {});
+        }
+        resolve({ approved, reason: approved ? "approved" : "rejected" });
+      },
+      messageId: sentMsgId,
+    });
+  });
+}
+
+export function handleApprovalCallback(callbackData, callbackQueryId) {
+  if (!callbackData) return false;
+  const match = callbackData.match(/^(approve|reject):(.+)$/);
+  if (!match) return false;
+  const [, action, id] = match;
+  const pending = _pendingApprovals.get(id);
+  if (!pending) return false;
+  _pendingApprovals.delete(id); // hapus dulu sebelum resolve — cegah double-click
+  pending.resolve(action === "approve", callbackQueryId);
+  return true;
 }
 
 export function hasActiveLiveMessage() {

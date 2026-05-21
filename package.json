@@ -27,6 +27,7 @@
     ]
   },
   "dependencies": {
+    "express": "^4.18.2",
     "@meteora-ag/dlmm": "1.9.4",
     "@solana/web3.js": "^1.95.0",
     "bn.js": "^5.2.1",

@@ -42,7 +42,8 @@ const TIMEFRAME_MINUTES = {
   "24h": 1440,
 };
 import { log, logAction } from "../logger.js";
-import { notifyDeploy, notifyClose, notifySwap } from "../telegram.js";
+import { notifyDeploy, notifyClose, notifySwap, requestApproval, isEnabled as telegramEnabled } from "../telegram.js";
+import { recordDeploy, recordClose, getOpenTrades } from "../lib/pnl_tracker.js";
 
 function numberOrNull(value) {
   const n = Number(value);
@@ -84,39 +85,51 @@ async function fetchFreshPoolDetail(poolAddress, timeframe = config.screening.ti
 
 async function validateDeployPoolThresholds(args) {
   let detail;
+  let usingFallback = false;
   try {
     detail = await fetchFreshPoolDetail(args.pool_address);
-    if (!detail) throw new Error(`Pool ${args.pool_address} not found`);
+    if (!detail) {
+      // Pool dropped out of discovery API (data sync delay or fell out of trending).
+      // The screener already validated it moments ago — use args as fallback rather
+      // than blocking a potentially good deploy on a transient API gap.
+      log("screening", `Pool ${args.pool_address} not found in re-fetch — falling back to screener data`);
+      usingFallback = true;
+    }
   } catch (error) {
-    return {
-      pass: false,
-      reason: `Could not verify pool screening thresholds before deploy: ${error.message}`,
-    };
+    log("screening", `Pool re-fetch error: ${error.message} — falling back to screener data`);
+    usingFallback = true;
   }
 
-  const tvl = poolDetailTvl(detail);
+  // TVL check — use args.tvl as fallback when detail is unavailable
+  const tvl = usingFallback ? numberOrNull(args.tvl) : poolDetailTvl(detail);
   const minTvl = numberOrNull(config.screening.minTvl);
   const maxTvl = numberOrNull(config.screening.maxTvl);
-  if (tvl == null) {
-    return {
-      pass: false,
-      reason: "Could not verify pool TVL before deploy.",
-    };
-  }
-  if (minTvl != null && minTvl > 0 && tvl < minTvl) {
-    return {
-      pass: false,
-      reason: `Pool TVL $${tvl} is below configured minTvl $${minTvl}.`,
-    };
-  }
-  if (maxTvl != null && maxTvl > 0 && tvl > maxTvl) {
-    return {
-      pass: false,
-      reason: `Pool TVL $${tvl} is above configured maxTvl $${maxTvl}.`,
-    };
+  if (!usingFallback) {
+    if (tvl == null) {
+      return { pass: false, reason: "Could not verify pool TVL before deploy." };
+    }
+    if (minTvl != null && minTvl > 0 && tvl < minTvl) {
+      return { pass: false, reason: `Pool TVL $${tvl} is below configured minTvl $${minTvl}.` };
+    }
+    if (maxTvl != null && maxTvl > 0 && tvl > maxTvl) {
+      return { pass: false, reason: `Pool TVL $${tvl} is above configured maxTvl $${maxTvl}.` };
+    }
+  } else if (tvl != null) {
+    if (minTvl != null && minTvl > 0 && tvl < minTvl) {
+      return { pass: false, reason: `Pool TVL $${tvl} (screener data) is below configured minTvl $${minTvl}.` };
+    }
+    if (maxTvl != null && maxTvl > 0 && tvl > maxTvl) {
+      return { pass: false, reason: `Pool TVL $${tvl} (screener data) is above configured maxTvl $${maxTvl}.` };
+    }
   }
 
-  const feeActiveTvlRatio = poolDetailFeeActiveTvlRatio(detail);
+  // At short timeframes (5m), fee_active_tvl_ratio can be 0 even for active pools
+  // because no fees were collected in that exact window. Fall back to the ratio
+  // already verified by the screener (passed in args.fee_tvl_ratio).
+  let feeActiveTvlRatio = usingFallback ? null : poolDetailFeeActiveTvlRatio(detail);
+  if (!feeActiveTvlRatio && args.fee_tvl_ratio != null) {
+    feeActiveTvlRatio = numberOrNull(args.fee_tvl_ratio);
+  }
   const minFeeActiveTvlRatio = numberOrNull(config.screening.minFeeActiveTvlRatio);
   if (
     minFeeActiveTvlRatio != null &&
@@ -131,7 +144,7 @@ async function validateDeployPoolThresholds(args) {
 
   const volatilityTimeframe = getVolatilityTimeframe(config.screening.timeframe || "5m");
   let volatilityDetail = detail;
-  if ((config.screening.timeframe || "5m") !== volatilityTimeframe) {
+  if (!usingFallback && (config.screening.timeframe || "5m") !== volatilityTimeframe) {
     try {
       volatilityDetail = await fetchFreshPoolDetail(args.pool_address, volatilityTimeframe);
     } catch (error) {
@@ -142,15 +155,23 @@ async function validateDeployPoolThresholds(args) {
     }
   }
 
-  const volatility = poolDetailVolatility(volatilityDetail);
+  // Use args.volatility as fallback when detail is unavailable
+  const volatility = usingFallback
+    ? numberOrNull(args.volatility)
+    : poolDetailVolatility(volatilityDetail);
   if (volatility == null || volatility <= 0) {
-    return {
-      pass: false,
-      reason: `Pool ${volatilityTimeframe} volatility ${volatility ?? "unknown"} is unusable. Refusing deploy.`,
-    };
+    if (usingFallback) {
+      // Screener pre-validated this pool — proceed without volatility check
+      log("screening", `Volatility unavailable for ${args.pool_address} (fallback mode) — skipping volatility check`);
+    } else {
+      return {
+        pass: false,
+        reason: `Pool ${volatilityTimeframe} volatility ${volatility ?? "unknown"} is unusable. Refusing deploy.`,
+      };
+    }
   }
 
-  const actualBinStep = poolDetailBinStep(detail);
+  const actualBinStep = usingFallback ? numberOrNull(args.bin_step) : poolDetailBinStep(detail);
   const minStep = numberOrNull(config.screening.minBinStep);
   const maxStep = numberOrNull(config.screening.maxBinStep);
   if (actualBinStep != null && minStep != null && actualBinStep < minStep) {
@@ -598,9 +619,23 @@ export async function executeTool(name, args) {
       if (name === "swap_token" && result.tx) {
         notifySwap({ inputSymbol: args.input_mint?.slice(0, 8), outputSymbol: args.output_mint === "So11111111111111111111111111111111111111112" || args.output_mint === "SOL" ? "SOL" : args.output_mint?.slice(0, 8), amountIn: result.amount_in, amountOut: result.amount_out, tx: result.tx }).catch(() => {});
       } else if (name === "deploy_position") {
-        notifyDeploy({ pair: result.pool_name || args.pool_name || args.pool_address?.slice(0, 8), amountSol: args.amount_y ?? args.amount_sol ?? 0, position: result.position, tx: result.txs?.[0] ?? result.tx, priceRange: result.price_range, rangeCoverage: result.range_coverage, binStep: result.bin_step, baseFee: result.base_fee }).catch(() => {});
+        // 🔴 BUG FIX: Jangan kirim notifikasi Telegram di dry run — data position/tx kosong.
+        // Screening cycle report sudah handle notifikasi dry run.
+        if (!result.dry_run) {
+          notifyDeploy({ pair: result.pool_name || args.pool_name || args.pool_address?.slice(0, 8), amountSol: args.amount_y ?? args.amount_sol ?? 0, position: result.position, tx: result.txs?.[0] ?? result.tx, priceRange: result.price_range, rangeCoverage: result.range_coverage, binStep: result.bin_step, baseFee: result.base_fee }).catch(() => {});
+        } else {
+          log("executor", `[Dry run] Would deploy: ${args.pool_name || args.pool_address?.slice(0, 8)} ${args.amount_y ?? args.amount_sol} SOL`);
+        }
+        recordDeploy({ poolAddress: args.pool_address, poolName: result.pool_name || args.pool_name, positionAddress: result.position, amountSol: args.amount_y ?? args.amount_sol ?? 0, isDryRun: Boolean(result.dry_run || process.env.DRY_RUN === "true" || config.dryRun === true), binsBelow: args.bins_below, activeBin: result.active_bin, feeTvlRatio: args.fee_tvl_ratio, baseMint: args.base_mint });
       } else if (name === "close_position") {
-        notifyClose({ pair: result.pool_name || args.position_address?.slice(0, 8), pnlUsd: result.pnl_usd ?? 0, pnlPct: result.pnl_pct ?? 0 }).catch(() => {});
+        // 🔴 BUG FIX: Jangan kirim notifikasi close di dry run — pnl data kosong.
+        if (!result.dry_run) {
+          notifyClose({ pair: result.pool_name || args.position_address?.slice(0, 8), pnlUsd: result.pnl_usd ?? 0, pnlPct: result.pnl_pct ?? 0 }).catch(() => {});
+        }
+        // Ambil harga SOL saat close untuk konversi pnl_usd → pnl_sol yang akurat
+        let _solPriceAtClose = null;
+        try { const _bal = await getWalletBalances({}); _solPriceAtClose = _bal.sol_price > 0 ? _bal.sol_price : null; } catch { /* ignore */ }
+        recordClose({ positionAddress: args.position_address, poolAddress: result.pool || args.pool_address, poolName: result.pool_name || args.position_address?.slice(0, 8), pnlPct: result.pnl_pct ?? null, pnlUsd: result.pnl_usd ?? null, feesUsd: result.fees_usd ?? null, closeReason: args.reason ?? null, solPrice: _solPriceAtClose });
         // Note low-yield closes in pool memory so screener avoids redeploying
         if (args.reason && args.reason.toLowerCase().includes("yield")) {
           const poolAddr = result.pool || args.pool_address;
@@ -736,7 +771,15 @@ async function runSafetyChecks(name, args) {
       }
 
       // Check position count limit + duplicate pool guard — force fresh scan to avoid stale cache
-      const positions = await getMyPositions({ force: true });
+      const positions = (process.env.DRY_RUN === "true" || config.dryRun === true)
+        ? {
+            total_positions: getOpenTrades().length,
+            positions: getOpenTrades().map((trade) => ({
+              pool: trade.pool_address,
+              base_mint: trade.base_mint,
+            })),
+          }
+        : await getMyPositions({ force: true });
       if (positions.total_positions >= config.risk.maxPositions) {
         return {
           pass: false,
@@ -789,8 +832,8 @@ async function runSafetyChecks(name, args) {
         };
       }
 
-      // Check SOL balance
-      if (process.env.DRY_RUN !== "true") {
+      // Check SOL balance — skip bila dry run (cek keduanya agar konsisten dgn isDryRunMode)
+      if (process.env.DRY_RUN !== "true" && config.dryRun !== true) {
         const balance = await getWalletBalances();
         const gasReserve = config.management.gasReserve;
         const minRequired = amountY + gasReserve;
@@ -800,6 +843,32 @@ async function runSafetyChecks(name, args) {
             reason: `Insufficient SOL: have ${balance.sol} SOL, need ${minRequired} SOL (${amountY} deploy + ${gasReserve} gas reserve).`,
           };
         }
+      }
+
+      // Manual approval gate — if enabled, ask user via Telegram before deploying
+      if (config.requireApproval && telegramEnabled()) {
+        const poolName = args.pool_name || args.pool_address?.slice(0, 8) || "unknown";
+        const tvlStr = args.tvl != null ? `$${Number(args.tvl).toLocaleString()}` : "?";
+        const feeTvl = args.fee_tvl_ratio != null ? `${(Number(args.fee_tvl_ratio) * 100).toFixed(2)}%` : "?";
+        const organic = args.organic != null ? args.organic : "?";
+        const approvalText = [
+          `🔔 <b>Deploy Approval Required</b>`,
+          ``,
+          `Pool: <b>${poolName}</b>`,
+          `Amount: <b>${amountY} SOL</b>`,
+          `TVL: ${tvlStr} | Fee/TVL: ${feeTvl} | Organic: ${organic}`,
+          ``,
+          `Setuju deploy? (auto-approve 1 menit)`,
+        ].join("\n");
+        log("screening", `Waiting for manual approval: ${poolName}`);
+        const { approved, reason } = await requestApproval({ text: approvalText, timeoutMs: 60_000 });
+        if (!approved) {
+          return {
+            pass: false,
+            reason: `Deploy ditolak pengguna atau timeout (${reason}): ${poolName}`,
+          };
+        }
+        log("screening", `Manual approval granted: ${poolName}`);
       }
 
       return { pass: true };

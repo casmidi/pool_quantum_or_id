@@ -5,6 +5,7 @@
   "llmApiKey": "",
   "llmModel": "minimax/minimax-m2.7",
   "dryRun": true,
+  "dry_run_wallet": 0.5,
 
   "deployAmountSol": 0.5,
   "maxPositions": 3,

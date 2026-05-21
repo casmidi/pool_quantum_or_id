@@ -17,12 +17,12 @@ import {
   sendMessage,
   sendMessageWithButtons,
   sendHTML,
-  editMessage,
   editMessageWithButtons,
   answerCallbackQuery,
   notifyOutOfRange,
   isEnabled as telegramEnabled,
   createLiveMessage,
+  handleApprovalCallback,
 } from "./telegram.js";
 import { generateBriefing } from "./briefing.js";
 import { getLastBriefingDate, setLastBriefingDate, getTrackedPosition, setPositionInstruction, updatePnlAndCheckExits, queuePeakConfirmation, resolvePendingPeak, queueTrailingDropConfirmation, resolvePendingTrailingDrop } from "./state.js";
@@ -31,6 +31,7 @@ import { recordPositionSnapshot, recallForPool, addPoolNote } from "./pool-memor
 import { checkSmartWalletsOnPool } from "./smart-wallets.js";
 import { getTokenNarrative, getTokenInfo } from "./tools/token.js";
 import { stageSignals } from "./signal-tracker.js";
+import { getSummary, formatSummaryTelegram, resetBalance, simulateDryRunCloses, getOpenTrades } from "./lib/pnl_tracker.js";
 import { getWeightsSummary } from "./signal-weights.js";
 import { bootstrapHiveMind, ensureAgentId, getHiveMindPullMode, isHiveMindEnabled, pullHiveMindLessons, pullHiveMindPresets, registerHiveMindAgent, startHiveMindBackgroundSync } from "./hivemind.js";
 import { appendDecision } from "./decision-log.js";
@@ -51,6 +52,56 @@ if (isMain) {
 
 const TP_PCT = config.management.takeProfitPct;
 const DEPLOY = config.management.deployAmountSol;
+
+function isDryRunMode() {
+  return config.dryRun === true || process.env.DRY_RUN === "true";
+}
+
+function getDryRunAccountSnapshot() {
+  const summary = getSummary();
+  return {
+    wallet: "dry-run-simulation",
+    sol: summary.current_sol,
+    sol_price: null,
+    sol_usd: null,
+    usdc: 0,
+    tokens: [],
+    total_usd: null,
+    simulated: true,
+    summary,
+  };
+}
+
+function getDryRunPositionsSnapshot() {
+  const summary = getSummary();
+  const positions = getOpenTrades().map((trade) => {
+    const deployedAt = new Date(trade.deploy_time).getTime();
+    const ageMinutes = Number.isFinite(deployedAt) ? Math.floor((Date.now() - deployedAt) / 60000) : null;
+    return {
+      position: trade.position_address,
+      pool: trade.pool_address,
+      base_mint: trade.base_mint ?? null,
+      pair: trade.pool_name || trade.pool_address?.slice(0, 8) || "dry-run",
+      amount_sol: Number(trade.amount_sol ?? 0),
+      total_value_sol: Number(trade.amount_sol ?? 0),
+      total_value_usd: Number(trade.amount_sol ?? 0),
+      pnl_usd: 0,
+      pnl_pct: 0,
+      unclaimed_fees_usd: 0,
+      age_minutes: ageMinutes,
+      in_range: true,
+      dry_run: true,
+      target_close_minutes: trade.target_close_minutes ?? null,
+    };
+  });
+  return {
+    wallet: "dry-run-simulation",
+    total_positions: summary.open_positions,
+    positions,
+    simulated: true,
+    summary,
+  };
+}
 
 // ═══════════════════════════════════════════
 //  CYCLE TIMERS
@@ -209,6 +260,24 @@ export async function runManagementCycle({ silent = false } = {}) {
   try {
     if (!silent && telegramEnabled()) {
       liveMessage = await createLiveMessage("🔄 Management Cycle", "Evaluating positions...");
+    }
+    if (isDryRunMode()) {
+      const closed = simulateDryRunCloses({});
+      const sim = getSummary();
+      if (closed > 0) {
+        log("cron", `Dry-run simulation closed ${closed} position(s); balance ${sim.current_sol} SOL`);
+      }
+      if (sim.open_positions === 0) {
+        log("cron", "No simulated open positions — triggering screening cycle");
+        mgmtReport = "No simulated open positions. Triggering screening cycle.";
+        runScreeningCycle().catch((e) => log("cron_error", `Triggered screening failed: ${e.message}`));
+        return mgmtReport;
+      }
+      // 🔴 BUG FIX: Set mgmtReport agar finally block kirim Telegram.
+      // Sebelumnya return langsung string → mgmtReport tetap null → finally skip.
+      mgmtReport = `Dry-run simulation: ${sim.open_positions} open position(s), balance ${sim.current_sol} SOL.`;
+      log("cron", mgmtReport);
+      return mgmtReport;
     }
     const livePositions = await getMyPositions({ force: true }).catch(() => null);
     positions = livePositions?.positions || [];
@@ -389,7 +458,10 @@ export async function runScreeningCycle({ silent = false } = {}) {
   let liveMessage = null;
   let screenReport = null;
   try {
-    [prePositions, preBalance] = await Promise.all([getMyPositions({ force: true }), getWalletBalances()]);
+    const isDryRun = isDryRunMode();
+    [prePositions, preBalance] = isDryRun
+      ? [getDryRunPositionsSnapshot(), getDryRunAccountSnapshot()]
+      : await Promise.all([getMyPositions({ force: true }), getWalletBalances()]);
     if (prePositions.total_positions >= config.risk.maxPositions) {
       log("cron", `Screening skipped — max positions reached (${prePositions.total_positions}/${config.risk.maxPositions})`);
       screenReport = `Screening skipped — max positions reached (${prePositions.total_positions}/${config.risk.maxPositions}).`;
@@ -403,7 +475,6 @@ export async function runScreeningCycle({ silent = false } = {}) {
       return screenReport;
     }
     const minRequired = config.management.deployAmountSol + config.management.gasReserve;
-    const isDryRun = process.env.DRY_RUN === "true";
     if (!isDryRun && preBalance.sol < minRequired) {
       log("cron", `Screening skipped — insufficient SOL (${preBalance.sol.toFixed(3)} < ${minRequired} needed for deploy + gas)`);
       screenReport = `Screening skipped — insufficient SOL (${preBalance.sol.toFixed(3)} < ${minRequired} needed for deploy + gas).`;
@@ -412,6 +483,18 @@ export async function runScreeningCycle({ silent = false } = {}) {
         actor: "SCREENER",
         summary: "Screening skipped",
         reason: `Insufficient SOL (${preBalance.sol.toFixed(3)} < ${minRequired})`,
+      });
+      _screeningBusy = false;
+      return screenReport;
+    }
+    if (isDryRun && preBalance.sol < minRequired) {
+      log("cron", `Dry-run screening skipped: simulated SOL locked/insufficient (${preBalance.sol.toFixed(3)} < ${minRequired} needed for deploy + reserve)`);
+      screenReport = `Dry-run screening skipped: simulated SOL locked/insufficient (${preBalance.sol.toFixed(3)} < ${minRequired} needed for deploy + reserve).`;
+      appendDecision({
+        type: "skip",
+        actor: "SCREENER",
+        summary: "Dry-run screening skipped",
+        reason: `Simulated SOL locked/insufficient (${preBalance.sol.toFixed(3)} < ${minRequired})`,
       });
       _screeningBusy = false;
       return screenReport;
@@ -431,7 +514,7 @@ export async function runScreeningCycle({ silent = false } = {}) {
     // Reuse pre-fetched balance — no extra RPC call needed
     const currentBalance = preBalance;
     const deployAmount = computeDeployAmount(currentBalance.sol);
-    log("cron", `Computed deploy amount: ${deployAmount} SOL (wallet: ${currentBalance.sol} SOL)`);
+    log("cron", `Computed deploy amount: ${deployAmount} SOL (${currentBalance.simulated ? "simulated" : "wallet"}: ${currentBalance.sol} SOL)`);
 
     // Load active strategy
     const activeStrategy = getActiveStrategy();
@@ -608,10 +691,11 @@ export async function runScreeningCycle({ silent = false } = {}) {
 
     let deployAttempted = false;
     let deploySucceeded = false;
+    let lastDeployOutcome = null;
     const { content } = await agentLoop(`
 SCREENING CYCLE
 ${strategyBlock}
-Positions: ${prePositions.total_positions}/${config.risk.maxPositions} | SOL: ${currentBalance.sol.toFixed(3)} | Deploy: ${deployAmount} SOL
+Positions: ${prePositions.total_positions}/${config.risk.maxPositions} | ${currentBalance.simulated ? "SIM SOL" : "SOL"}: ${currentBalance.sol.toFixed(3)} | Deploy: ${deployAmount} SOL
 
 PRE-LOADED CANDIDATES (${passing.length} pools):
 ${candidateBlocks.join("\n\n")}
@@ -640,6 +724,8 @@ STEPS:
      range_coverage.downside_pct
      range_coverage.upside_pct
      range_coverage.width_pct
+   - If deploy_position returns dry_run: true, do NOT write DEPLOYED.
+     Write DRY RUN - NO REAL DEPLOY and state that no on-chain transaction was sent.
 
    MARKET
    Fee/TVL: <x>%
@@ -687,25 +773,58 @@ IMPORTANT:
         onToolFinish: async ({ name, result, success }) => {
           if (name === "deploy_position") {
             deployAttempted = true;
-            deploySucceeded = Boolean(success && result?.success !== false && !result?.error && !result?.blocked);
+            const deployResult = result?.result ?? result;
+            const isDryRunDeploy = Boolean(
+              deployResult?.dry_run ||
+              deployResult?.would_deploy ||
+              String(deployResult?.message ?? "").toUpperCase().includes("DRY RUN")
+            );
+            lastDeployOutcome = deployResult;
+            deploySucceeded = Boolean(
+              success &&
+              result?.success !== false &&
+              !result?.error &&
+              !result?.blocked &&
+              !deployResult?.error &&
+              !deployResult?.blocked &&
+              !isDryRunDeploy
+            );
           }
           await liveMessage?.toolFinish(name, result, success);
         },
       });
     screenReport = content;
+    if (deployAttempted && !deploySucceeded) {
+      const isDryRunDeploy = Boolean(
+        lastDeployOutcome?.dry_run ||
+        lastDeployOutcome?.would_deploy ||
+        String(lastDeployOutcome?.message ?? "").toUpperCase().includes("DRY RUN")
+      );
+      if (isDryRunDeploy) {
+        const would = lastDeployOutcome?.would_deploy ?? {};
+        screenReport = [
+          "DRY RUN - NO REAL DEPLOY",
+          "",
+          would.pool_address ? `Pool: ${would.pool_address}` : null,
+          would.amount_y != null ? `Amount: ${would.amount_y} SOL` : null,
+          would.strategy ? `Strategy: ${would.strategy}` : null,
+          "No on-chain transaction was sent because DRY_RUN is enabled.",
+        ].filter(Boolean).join("\n");
+      }
+    }
     if (/⛔\s*NO DEPLOY/i.test(content)) {
       appendDecision({
         type: "no_deploy",
         actor: "SCREENER",
         summary: "LLM chose no deploy",
-        reason: stripThink(content).slice(0, 500),
+        reason: stripThink(screenReport).slice(0, 500),
       });
     } else if (!deploySucceeded) {
       appendDecision({
         type: "no_deploy",
         actor: "SCREENER",
         summary: deployAttempted ? "Deploy attempt did not succeed" : "No successful deploy in screening cycle",
-        reason: stripThink(content).slice(0, 500),
+        reason: stripThink(screenReport).slice(0, 500),
       });
     }
   } catch (error) {
@@ -767,6 +886,14 @@ Summarize the current portfolio health, total fees earned, and performance of al
     if (_managementBusy || _screeningBusy || _pnlPollBusy) return;
     _pnlPollBusy = true;
     try {
+      if (isDryRunMode()) {
+        const closed = simulateDryRunCloses({});
+        if (closed > 0) {
+          const sim = getSummary();
+          log("state", `[Dry-run poll] Closed ${closed} simulated position(s); balance ${sim.current_sol} SOL`);
+        }
+        return;
+      }
       const result = await getMyPositions({ force: true, silent: true }).catch(() => null);
       if (!result?.positions?.length) return;
       for (const p of result.positions) {
@@ -972,14 +1099,16 @@ function describeLatestCandidates(limit = 5) {
 }
 
 function formatWalletStatus(wallet, positions) {
-  const deployAmount = computeDeployAmount(wallet.sol);
+  const account = isDryRunMode() ? getDryRunAccountSnapshot() : wallet;
+  const pos = isDryRunMode() ? getDryRunPositionsSnapshot() : positions;
+  const deployAmount = computeDeployAmount(account.sol);
   const hive = isHiveMindEnabled() ? "on" : "off";
   return [
-    `Wallet: ${wallet.sol} SOL ($${wallet.sol_usd})`,
-    `SOL price: $${wallet.sol_price}`,
-    `Open positions: ${positions.total_positions}/${config.risk.maxPositions}`,
+    `${account.simulated ? "Sim balance" : "Wallet"}: ${account.sol} SOL${account.sol_usd != null ? ` ($${account.sol_usd})` : ""}`,
+    account.sol_price != null ? `SOL price: $${account.sol_price}` : `SOL price: n/a`,
+    `Open positions: ${pos.total_positions}/${config.risk.maxPositions}`,
     `Next deploy amount: ${deployAmount} SOL`,
-    `Dry run: ${process.env.DRY_RUN === "true" ? "yes" : "no"}`,
+    `Dry run: ${isDryRunMode() ? "yes" : "no"}`,
     `HiveMind: ${hive}`,
   ].join("\n");
 }
@@ -1259,6 +1388,8 @@ function formatHelpText() {
     "Telegram commands",
     "",
     "/help — show commands",
+    "/summary — P&L summary (balance, win rate, best/worst trade)",
+    "/resetbalance [sol] — reset simulated balance (default 0.5 SOL)",
     "/status — wallet + positions snapshot",
     "/wallet — wallet, deploy amount, HiveMind status",
     "/positions — list open positions",
@@ -1332,7 +1463,11 @@ async function deployLatestCandidate(index) {
       throw new Error(`NO DEPLOY: only cached candidate ${candidate.name} is not worth deploying — ${skipReason}`);
     }
   }
-  const deployAmount = computeDeployAmount((await getWalletBalances()).sol);
+  const account = isDryRunMode() ? getDryRunAccountSnapshot() : await getWalletBalances();
+  const deployAmount = computeDeployAmount(account.sol);
+  if (deployAmount <= 0) {
+    throw new Error(`Insufficient ${account.simulated ? "simulated " : ""}SOL for deploy after reserve (${account.sol} SOL available).`);
+  }
   const binsBelow = computeBinsBelow(candidate.volatility);
   const result = await executeTool("deploy_position", {
     pool_address: candidate.pool,
@@ -1380,6 +1515,7 @@ async function drainTelegramQueue() {
 async function telegramHandler(msg) {
   const text = msg?.text?.trim();
   if (!text) return;
+  if (msg?.isCallback && handleApprovalCallback(msg.callbackData, msg.callbackQueryId)) return;
   if (msg?.isCallback && text.startsWith("cfg:")) {
     try {
       await applySettingsMenuCallback(msg);
@@ -1392,7 +1528,11 @@ async function telegramHandler(msg) {
     await showSettingsMenu().catch((e) => sendMessage(`Settings error: ${e.message}`).catch(() => {}));
     return;
   }
-  if (_managementBusy || _screeningBusy || busy) {
+  // Commands yang langsung dieksekusi tanpa antri (hanya baca data, tidak ganggu agent)
+  const INSTANT_COMMANDS = ["/summary", "/resetbalance", "/config", "/help"];
+  const isInstant = INSTANT_COMMANDS.some(c => text === c || text.startsWith(c + " "));
+
+  if (!isInstant && (_managementBusy || _screeningBusy || busy)) {
     if (_telegramQueue.length < 5) {
       _telegramQueue.push(msg);
       sendMessage(`⏳ Queued (${_telegramQueue.length} in queue): "${text.slice(0, 60)}"`).catch(() => {});
@@ -1417,9 +1557,30 @@ async function telegramHandler(msg) {
     return;
   }
 
+  if (text === "/summary") {
+    try {
+      const html = formatSummaryTelegram(config.dryRun ?? true);
+      await sendHTML(html).catch(() => {});
+    } catch (e) {
+      await sendMessage(`Error: ${e.message}`).catch(() => {});
+    }
+    return;
+  }
+
+  if (text.startsWith("/resetbalance")) {
+    const parts = text.split(" ");
+    const raw = parseFloat(parts[1]);
+    const sol = Number.isFinite(raw) ? Math.max(0.01, Math.min(1000, raw)) : 0.5;
+    resetBalance(sol);
+    await sendMessage(`Balance direset ke ${sol} SOL. Semua history trade dihapus.`).catch(() => {});
+    return;
+  }
+
   if (text === "/wallet" || text === "/status") {
     try {
-      const [wallet, positions] = await Promise.all([getWalletBalances(), getMyPositions({ force: true })]);
+      const [wallet, positions] = isDryRunMode()
+        ? [getDryRunAccountSnapshot(), getDryRunPositionsSnapshot()]
+        : await Promise.all([getWalletBalances(), getMyPositions({ force: true })]);
       const suffix = text === "/status" && positions.total_positions
         ? `\n\nUse /positions for the numbered list.`
         : "";
@@ -1437,16 +1598,20 @@ async function telegramHandler(msg) {
 
   if (text === "/positions") {
     try {
-      const { positions, total_positions } = await getMyPositions({ force: true });
+      const { positions, total_positions } = isDryRunMode()
+        ? getDryRunPositionsSnapshot()
+        : await getMyPositions({ force: true });
       if (total_positions === 0) { await sendMessage("No open positions."); return; }
-      const cur = config.management.solMode ? "◎" : "$";
+      const cur = isDryRunMode() ? "SOL" : (config.management.solMode ? "◎" : "$");
       const lines = positions.map((p, i) => {
+        const value = isDryRunMode() ? `${p.total_value_sol ?? p.amount_sol} SOL` : `${cur}${p.total_value_usd}`;
         const pnl = p.pnl_usd >= 0 ? `+${cur}${p.pnl_usd}` : `-${cur}${Math.abs(p.pnl_usd)}`;
         const age = p.age_minutes != null ? `${p.age_minutes}m` : "?";
         const oor = !p.in_range ? " ⚠️OOR" : "";
-        return `${i + 1}. ${p.pair} | ${cur}${p.total_value_usd} | PnL: ${pnl} | fees: ${cur}${p.unclaimed_fees_usd} | ${age}${oor}`;
+        return `${i + 1}. ${p.pair} | ${value} | PnL: ${pnl} | fees: ${cur}${p.unclaimed_fees_usd} | ${age}${oor}`;
       });
-      await sendMessage(`📊 Open Positions (${total_positions}):\n\n${lines.join("\n")}\n\n/close <n> to close | /set <n> <note> to set instruction`);
+      const footer = isDryRunMode() ? "Simulated dry-run positions from pnl_log.json." : "/close <n> to close | /set <n> <note> to set instruction";
+      await sendMessage(`📊 Open Positions (${total_positions}):\n\n${lines.join("\n")}\n\n${footer}`);
     } catch (e) { await sendMessage(`Error: ${e.message}`).catch(() => {}); }
     return;
   }

@@ -5,6 +5,7 @@ import { log } from "../logger.js";
 import { isBaseMintOnCooldown, isPoolOnCooldown } from "../pool-memory.js";
 import { confirmIndicatorPreset } from "./chart-indicators.js";
 import { getAgentMeridianBase, getAgentMeridianHeaders } from "./agent-meridian.js";
+import { scorePool, applyDarwinWeights } from "../strategy/pool-scorer.js";
 
 const DATAPI_JUP = "https://datapi.jup.ag/v1";
 
@@ -25,6 +26,19 @@ const PVP_RIVAL_LIMIT = 2;
 const PVP_MIN_ACTIVE_TVL = 5_000;
 const PVP_MIN_HOLDERS = 500;
 const PVP_MIN_GLOBAL_FEES_SOL = 30;
+
+// Cached Darwin scorer weights — loaded once per process, refreshed on recalc
+let _darwinScorerWeightsCache = null;
+async function loadDarwinScorerWeights() {
+  if (_darwinScorerWeightsCache) return _darwinScorerWeightsCache;
+  try {
+    const { getDarwinScorerWeights } = await import("../signal-weights.js");
+    _darwinScorerWeightsCache = getDarwinScorerWeights();
+  } catch {
+    _darwinScorerWeightsCache = {};
+  }
+  return _darwinScorerWeightsCache;
+}
 
 function normalizeSymbol(symbol) {
   return String(symbol || "").trim().toUpperCase();
@@ -498,8 +512,17 @@ export async function getTopCandidates({ limit = 10 } = {}) {
   const filteredOut = Array.isArray(discovery.filtered_examples) ? [...discovery.filtered_examples] : [];
 
   // Exclude pools where the wallet already has an open position
-  const { getMyPositions } = await import("./dlmm.js");
-  const { positions } = await getMyPositions();
+  let positions = [];
+  if (config.dryRun === true || process.env.DRY_RUN === "true") {
+    const { getOpenTrades } = await import("../lib/pnl_tracker.js");
+    positions = getOpenTrades().map((trade) => ({
+      pool: trade.pool_address,
+      base_mint: trade.base_mint,
+    }));
+  } else {
+    const { getMyPositions } = await import("./dlmm.js");
+    ({ positions } = await getMyPositions());
+  }
   const occupiedPools = new Set(positions.map((p) => p.pool));
   const occupiedMints = new Set(positions.map((p) => p.base_mint).filter(Boolean));
   const minTvl = Number(config.screening.minTvl ?? 0);
@@ -697,6 +720,31 @@ export async function getTopCandidates({ limit = 10 } = {}) {
     if (eligible.length < before) {
       log("screening", `Indicator confirmation removed ${before - eligible.length} candidate(s)`);
     }
+  }
+
+  // Apply full pool-scorer scoring (with Darwin-adjusted weights) after all enrichment
+  if (eligible.length > 0) {
+    const darwinW = await loadDarwinScorerWeights();
+    const scorerWeights = applyDarwinWeights(darwinW);
+    for (const pool of eligible) {
+      const scored = scorePool(pool, scorerWeights);
+      pool.pool_score         = scored.score;
+      pool.pool_grade         = scored.grade;
+      pool.pool_recommendation = scored.recommendation;
+      pool.volatility_zone    = scored.volatility_zone;
+      pool.score_breakdown    = scored.breakdown;
+    }
+    eligible.sort((a, b) => (b.pool_score ?? 0) - (a.pool_score ?? 0));
+    log("screening", `Pool-scorer ranked ${eligible.length} candidate(s) — top score: ${eligible[0]?.pool_score ?? 0}`);
+    eligible.forEach((pool, i) => {
+      const feeAtvl = ((Number(pool.fee_active_tvl_ratio)||0)*100).toFixed(3)+'%';
+      const vol     = pool.volume_window > 1000 ? '$'+(pool.volume_window/1000).toFixed(1)+'k' : '$'+(Number(pool.volume_window||0).toFixed(0));
+      const inRange = (Number(pool.active_pct||0)).toFixed(1)+'%';
+      const organic = Math.round(Number(pool.organic_score||0));
+      const score   = pool.pool_score ?? 0;
+      const grade   = pool.pool_grade ?? 'D';
+      log("screening", `[${i+1}] ${pool.name} fee/aTVL: ${feeAtvl} vol: ${vol} in-range: ${inRange} organic: ${organic} score: ${score} grade: ${grade}`);
+    });
   }
 
   return {

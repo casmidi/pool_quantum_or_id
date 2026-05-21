@@ -1,0 +1,1272 @@
+<!DOCTYPE html>
+<html lang="id">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Pool — quantum.or.id</title>
+  <link rel="icon" type="image/svg+xml" href="https://quantum.or.id/images/quantum-icon.svg">
+  <link
+    href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@300;400;500;600&display=swap"
+    rel="stylesheet">
+  <style>
+    :root {
+      --bg: #0d0b14;
+      --surface: #13111e;
+      --card: #19172a;
+      --border: #2a2640;
+      --border2: #3d3860;
+      --accent: #9d8cff;
+      --accent2: #c4b8ff;
+      --green: #22d07a;
+      --green-bg: rgba(34, 208, 122, 0.08);
+      --green-b: rgba(34, 208, 122, 0.2);
+      --red: #ff5a6e;
+      --red-bg: rgba(255, 90, 110, 0.08);
+      --red-b: rgba(255, 90, 110, 0.2);
+      --yellow: #ffd166;
+      --text: #e8e4ff;
+      --muted: #7a7499;
+      --muted2: #4a4670;
+      --mono: 'IBM Plex Mono', monospace;
+      --sans: 'IBM Plex Sans', sans-serif
+    }
+
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0
+    }
+
+    html,
+    body {
+      height: 100%
+    }
+
+    body {
+      font-family: var(--sans);
+      background: var(--bg);
+      color: var(--text);
+      font-size: 14px
+    }
+
+    ::-webkit-scrollbar {
+      width: 4px
+    }
+
+    ::-webkit-scrollbar-track {
+      background: var(--bg)
+    }
+
+    ::-webkit-scrollbar-thumb {
+      background: var(--border2);
+      border-radius: 2px
+    }
+
+    .layout {
+      display: flex;
+      min-height: 100vh
+    }
+
+    .sidebar {
+      background: var(--surface);
+      border-right: 1px solid var(--border);
+      padding: 24px 0;
+      display: flex;
+      flex-direction: column;
+      position: fixed;
+      width: 220px;
+      height: 100vh;
+      overflow-y: auto;
+      z-index: 10
+    }
+
+    .logo {
+      padding: 0 20px 24px;
+      border-bottom: 1px solid var(--border);
+      margin-bottom: 16px
+    }
+
+    .logo-name {
+      font-family: var(--mono);
+      font-size: 16px;
+      font-weight: 600;
+      color: var(--accent2);
+      letter-spacing: .04em
+    }
+
+    .logo-sub {
+      font-size: 11px;
+      color: var(--muted);
+      margin-top: 2px;
+      font-family: var(--mono)
+    }
+
+    .nav-section {
+      padding: 0 12px;
+      margin-bottom: 8px
+    }
+
+    .nav-label {
+      font-size: 10px;
+      font-weight: 600;
+      color: var(--muted2);
+      letter-spacing: .1em;
+      text-transform: uppercase;
+      padding: 0 8px;
+      margin-bottom: 4px
+    }
+
+    .nav-item {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 8px 10px;
+      border-radius: 8px;
+      cursor: pointer;
+      color: var(--muted);
+      font-size: 13px;
+      transition: all .15s;
+      text-decoration: none
+    }
+
+    .nav-item:hover {
+      background: rgba(157, 140, 255, .08);
+      color: var(--text)
+    }
+
+    .nav-item.active {
+      background: rgba(157, 140, 255, .12);
+      color: var(--accent2)
+    }
+
+    .nav-icon {
+      width: 16px;
+      height: 16px;
+      opacity: .7
+    }
+
+    .sidebar-footer {
+      margin-top: auto;
+      padding: 16px 20px;
+      border-top: 1px solid var(--border)
+    }
+
+    .bot-status {
+      display: flex;
+      align-items: center;
+      gap: 8px
+    }
+
+    .status-dot {
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      background: var(--green);
+      flex-shrink: 0
+    }
+
+    .status-dot.live {
+      animation: pulse 2s infinite
+    }
+
+    .status-dot.offline {
+      background: var(--red)
+    }
+
+    @keyframes pulse {
+
+      0%,
+      100% {
+        opacity: 1;
+        box-shadow: 0 0 0 0 rgba(34, 208, 122, .4)
+      }
+
+      50% {
+        opacity: .7;
+        box-shadow: 0 0 0 4px rgba(34, 208, 122, 0)
+      }
+    }
+
+    .main {
+      margin-left: 220px;
+      padding: 28px;
+      flex: 1;
+      width: calc(100% - 220px)
+    }
+
+    .page {
+      display: none;
+      width: 100%
+    }
+
+    .page.active {
+      display: block
+    }
+
+    .page-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 24px
+    }
+
+    .page-title {
+      font-size: 20px;
+      font-weight: 500
+    }
+
+    .page-sub {
+      font-size: 13px;
+      color: var(--muted);
+      margin-top: 2px
+    }
+
+    .header-right {
+      display: flex;
+      align-items: center;
+      gap: 12px
+    }
+
+    .badge {
+      font-family: var(--mono);
+      font-size: 11px;
+      padding: 4px 10px;
+      border-radius: 6px;
+      font-weight: 500
+    }
+
+    .badge-dry {
+      background: rgba(255, 209, 102, .12);
+      color: var(--yellow);
+      border: 1px solid rgba(255, 209, 102, .2)
+    }
+
+    .badge-live {
+      background: var(--green-bg);
+      color: var(--green);
+      border: 1px solid var(--green-b)
+    }
+
+    .btn {
+      background: var(--card);
+      border: 1px solid var(--border);
+      color: var(--muted);
+      padding: 7px 14px;
+      border-radius: 8px;
+      font-size: 12px;
+      cursor: pointer;
+      font-family: var(--sans);
+      transition: all .15s;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px
+    }
+
+    .btn:hover {
+      border-color: var(--accent);
+      color: var(--accent)
+    }
+
+    .stats-grid {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 12px;
+      margin-bottom: 24px
+    }
+
+    .stat-card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 16px;
+      transition: border-color .2s
+    }
+
+    .stat-card:hover {
+      border-color: var(--border2)
+    }
+
+    .stat-label {
+      font-size: 11px;
+      color: var(--muted);
+      font-family: var(--mono);
+      letter-spacing: .06em;
+      text-transform: uppercase;
+      margin-bottom: 8px
+    }
+
+    .stat-value {
+      font-family: var(--mono);
+      font-size: 22px;
+      font-weight: 600;
+      color: var(--text);
+      line-height: 1
+    }
+
+    .stat-value.green {
+      color: var(--green)
+    }
+
+    .stat-value.red {
+      color: var(--red)
+    }
+
+    .stat-change {
+      font-size: 11px;
+      margin-top: 6px;
+      color: var(--muted)
+    }
+
+    .two-col {
+      display: grid;
+      grid-template-columns: 2fr 1fr;
+      gap: 16px;
+      margin-bottom: 16px;
+      align-items: start
+    }
+
+    .cal-two {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 16px;
+      align-items: start
+    }
+
+    .cycle-row {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 8px;
+      margin-bottom: 16px
+    }
+
+    .cycle-card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 12px 14px;
+      display: flex;
+      align-items: center;
+      gap: 10px
+    }
+
+    .cycle-icon {
+      width: 32px;
+      height: 32px;
+      border-radius: 8px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 14px;
+      flex-shrink: 0
+    }
+
+    .cycle-label {
+      font-size: 11px;
+      color: var(--muted);
+      margin-bottom: 2px
+    }
+
+    .cycle-time {
+      font-family: var(--mono);
+      font-size: 16px;
+      font-weight: 600;
+      color: var(--text)
+    }
+
+    .card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      overflow: hidden
+    }
+
+    .card-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 14px 16px;
+      border-bottom: 1px solid var(--border)
+    }
+
+    .card-title {
+      font-size: 12px;
+      font-weight: 600;
+      color: var(--muted);
+      font-family: var(--mono);
+      letter-spacing: .08em;
+      text-transform: uppercase
+    }
+
+    .card-body {
+      padding: 16px
+    }
+
+    .pool-table {
+      width: 100%;
+      border-collapse: collapse
+    }
+
+    .pool-table th {
+      font-family: var(--mono);
+      font-size: 10px;
+      color: var(--muted2);
+      text-transform: uppercase;
+      letter-spacing: .08em;
+      padding: 8px 12px;
+      text-align: left;
+      border-bottom: 1px solid var(--border)
+    }
+
+    .pool-table td {
+      padding: 10px 12px;
+      font-size: 12px;
+      border-bottom: 1px solid rgba(42, 38, 64, .5);
+      vertical-align: middle
+    }
+
+    .pool-table tr:last-child td {
+      border-bottom: none
+    }
+
+    .pool-table tr:hover td {
+      background: rgba(157, 140, 255, .04)
+    }
+
+    .pool-name {
+      font-family: var(--mono);
+      font-weight: 600;
+      font-size: 13px;
+      color: var(--text)
+    }
+
+    .pool-sub {
+      color: var(--muted);
+      font-size: 11px;
+      margin-top: 2px
+    }
+
+    .obar {
+      display: flex;
+      align-items: center;
+      gap: 6px
+    }
+
+    .bar-bg {
+      flex: 1;
+      height: 4px;
+      background: var(--border);
+      border-radius: 2px;
+      overflow: hidden
+    }
+
+    .bar-fill {
+      height: 100%;
+      border-radius: 2px;
+      transition: width .5s
+    }
+
+    .bar-fill.high {
+      background: var(--green)
+    }
+
+    .bar-fill.low {
+      background: var(--yellow)
+    }
+
+    .tag {
+      font-size: 10px;
+      font-family: var(--mono);
+      padding: 2px 7px;
+      border-radius: 4px
+    }
+
+    .tag-c {
+      background: rgba(157, 140, 255, .12);
+      color: var(--accent);
+      border: 1px solid rgba(157, 140, 255, .2)
+    }
+
+    .tag-d {
+      background: rgba(255, 90, 110, .08);
+      color: var(--red);
+      border: 1px solid var(--red-b)
+    }
+
+    .sec-sep {
+      padding: 8px 12px;
+      font-family: var(--mono);
+      font-size: 10px;
+      color: var(--muted2);
+      letter-spacing: .08em;
+      text-transform: uppercase;
+      background: rgba(255, 255, 255, .02);
+      border-bottom: 1px solid var(--border)
+    }
+
+    .log-wrap {
+      font-family: var(--mono);
+      font-size: 11px;
+      max-height: 500px;
+      overflow-y: auto;
+      display: flex;
+      flex-direction: column
+    }
+
+    .log-line {
+      display: flex;
+      gap: 8px;
+      padding: 5px 12px;
+      border-bottom: 1px solid rgba(42, 38, 64, .2);
+      line-height: 1.5
+    }
+
+    .log-line:hover {
+      background: rgba(157, 140, 255, .03)
+    }
+
+    .log-time {
+      color: var(--muted2);
+      flex-shrink: 0;
+      width: 76px;
+      font-size: 10px
+    }
+
+    .log-tag {
+      flex-shrink: 0;
+      font-size: 10px;
+      padding: 1px 6px;
+      border-radius: 3px;
+      height: fit-content;
+      margin-top: 1px;
+      width: 92px;
+      text-align: center
+    }
+
+    .lt-STARTUP {
+      background: rgba(157, 140, 255, .15);
+      color: var(--accent)
+    }
+
+    .lt-CRON {
+      background: rgba(34, 208, 122, .1);
+      color: var(--green)
+    }
+
+    .lt-ERROR,
+    .lt-CRON_ERROR {
+      background: rgba(255, 90, 110, .15);
+      color: var(--red)
+    }
+
+    .lt-HIVEMIND_WARN {
+      background: rgba(255, 209, 102, .1);
+      color: var(--yellow)
+    }
+
+    .lt-SCREENING {
+      background: rgba(196, 184, 255, .1);
+      color: var(--accent2)
+    }
+
+    .lt-AGENT {
+      background: rgba(157, 140, 255, .08);
+      color: var(--accent)
+    }
+
+    .lt-INIT {
+      background: rgba(34, 208, 122, .08);
+      color: var(--green)
+    }
+
+    .lt-SHUTDOWN {
+      background: rgba(255, 90, 110, .08);
+      color: var(--red)
+    }
+
+    .lt-other {
+      background: rgba(255, 255, 255, .04);
+      color: var(--muted)
+    }
+
+    .log-msg {
+      color: var(--text);
+      flex: 1;
+      word-break: break-word
+    }
+
+    .log-msg.err {
+      color: var(--red)
+    }
+
+    .log-msg.warn {
+      color: var(--yellow)
+    }
+
+    .wallet-addr {
+      font-family: var(--mono);
+      font-size: 11px;
+      color: var(--accent2);
+      word-break: break-all;
+      line-height: 1.6
+    }
+
+    .mrow {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 8px 0;
+      border-bottom: 1px solid var(--border)
+    }
+
+    .mrow:last-child {
+      border-bottom: none
+    }
+
+    .mkey {
+      font-size: 12px;
+      color: var(--muted)
+    }
+
+    .mval {
+      font-family: var(--mono);
+      font-size: 13px;
+      font-weight: 600
+    }
+
+    .mval.g {
+      color: var(--green)
+    }
+
+    .mval.r {
+      color: var(--red)
+    }
+
+    .mval.w {
+      color: var(--text)
+    }
+
+    .cal-hdr {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 16px
+    }
+
+    .cal-month-title {
+      font-family: var(--mono);
+      font-size: 14px;
+      font-weight: 600;
+      color: var(--text)
+    }
+
+    .cal-btn {
+      background: none;
+      border: 1px solid var(--border);
+      color: var(--muted);
+      width: 28px;
+      height: 28px;
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 14px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      transition: all .15s
+    }
+
+    .cal-btn:hover {
+      border-color: var(--accent);
+      color: var(--accent)
+    }
+
+    .cal-grid {
+      display: grid;
+      grid-template-columns: repeat(7, 1fr);
+      gap: 4px
+    }
+
+    .cdl {
+      font-family: var(--mono);
+      font-size: 10px;
+      color: var(--muted2);
+      text-align: center;
+      padding: 4px 0
+    }
+
+    .cd {
+      border-radius: 6px;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      padding: 6px 2px;
+      min-height: 44px;
+      cursor: default;
+      transition: all .15s
+    }
+
+    .cd.profit {
+      background: rgba(34, 208, 122, .12)
+    }
+
+    .cd.loss {
+      background: rgba(255, 90, 110, .12)
+    }
+
+    .cd.zero {
+      background: rgba(255, 255, 255, .03)
+    }
+
+    .cd.today {
+      border: 1px solid var(--accent)
+    }
+
+    .cdn {
+      font-size: 11px;
+      color: var(--muted);
+      line-height: 1;
+      margin-bottom: 3px
+    }
+
+    .cdp {
+      font-family: var(--mono);
+      font-size: 9px;
+      font-weight: 600;
+      line-height: 1
+    }
+
+    .cd.profit .cdp {
+      color: var(--green)
+    }
+
+    .cd.loss .cdp {
+      color: var(--red)
+    }
+
+    .cd.zero .cdp {
+      color: var(--muted2)
+    }
+
+    .err-box {
+      background: var(--red-bg);
+      border: 1px solid var(--red-b);
+      border-radius: 8px;
+      padding: 10px 14px;
+      font-size: 12px;
+      color: var(--red);
+      margin-bottom: 12px;
+      display: none
+    }
+
+    @media(max-width:900px) {
+      .sidebar {
+        display: none
+      }
+
+      .main {
+        margin-left: 0;
+        width: 100%;
+        padding: 16px
+      }
+
+      .stats-grid {
+        grid-template-columns: repeat(2, 1fr)
+      }
+
+      .two-col,
+      .cal-two {
+        grid-template-columns: 1fr
+      }
+
+      .cycle-row {
+        grid-template-columns: 1fr 1fr
+      }
+    }
+  </style>
+</head>
+
+<body>
+  <div class="layout">
+    <aside class="sidebar">
+      <div class="logo">
+        <div class="logo-name">⬡ Pool</div>
+        <div class="logo-sub">quantum.or.id</div>
+      </div>
+      <div class="nav-section">
+        <div class="nav-label">Dashboard</div>
+        <a class="nav-item active" onclick="go('overview',this)">
+          <svg class="nav-icon" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <rect x="3" y="3" width="7" height="7" rx="1" stroke-width="1.5" />
+            <rect x="14" y="3" width="7" height="7" rx="1" stroke-width="1.5" />
+            <rect x="3" y="14" width="7" height="7" rx="1" stroke-width="1.5" />
+            <rect x="14" y="14" width="7" height="7" rx="1" stroke-width="1.5" />
+          </svg>
+          Overview
+        </a>
+        <a class="nav-item" onclick="go('calendar',this)">
+          <svg class="nav-icon" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <rect x="3" y="4" width="18" height="18" rx="2" stroke-width="1.5" />
+            <path d="M16 2v4M8 2v4M3 10h18" stroke-width="1.5" />
+          </svg>
+          PnL Calendar
+        </a>
+        <a class="nav-item" onclick="go('pools',this)">
+          <svg class="nav-icon" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <circle cx="12" cy="12" r="9" stroke-width="1.5" />
+            <path d="M12 3v18M3 12h18" stroke-width="1.5" />
+          </svg>
+          Pool Candidates
+        </a>
+        <a class="nav-item" onclick="go('logs',this)">
+          <svg class="nav-icon" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" stroke-width="1.5" />
+            <path d="M14 2v6h6M16 13H8M16 17H8" stroke-width="1.5" />
+          </svg>
+          Log Activity
+        </a>
+      </div>
+      <div class="sidebar-footer">
+        <div class="bot-status">
+          <div class="status-dot" id="sDot"></div>
+          <div>
+            <div style="font-size:12px;color:var(--text)" id="sTxt">Connecting...</div>
+            <div style="font-size:10px;color:var(--muted);font-family:var(--mono)" id="sMode">—</div>
+          </div>
+        </div>
+      </div>
+    </aside>
+
+    <main class="main">
+
+      <!-- OVERVIEW -->
+      <div id="page-overview" class="page active">
+        <div class="page-header">
+          <div>
+            <div class="page-title">Overview</div>
+            <div class="page-sub" id="agentId">Meridian DLMM Bot</div>
+          </div>
+          <div class="header-right">
+            <span class="badge badge-dry" id="modeBadge">DRY RUN</span>
+            <button class="btn" onclick="loadAll()">↻ Refresh</button>
+          </div>
+        </div>
+        <div id="errBox" class="err-box"></div>
+        <div class="stats-grid">
+          <div class="stat-card">
+            <div class="stat-label">SOL Balance</div>
+            <div class="stat-value" id="solBal">—</div>
+            <div class="stat-change" id="solUsd">$0.00</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-label">Monthly PnL</div>
+            <div class="stat-value green" id="monthPnl">0.0000 SOL</div>
+            <div class="stat-change" id="tDays">0 trading days</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-label">Active Pools</div>
+            <div class="stat-value" id="actPools">0</div>
+            <div class="stat-change" id="poolSub">no positions</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-label">Win Rate</div>
+            <div class="stat-value" id="winRate">—</div>
+            <div class="stat-change" id="scrCnt">0 trades · 0 screenings</div>
+          </div>
+        </div>
+        <!-- SIMULATION CAPITAL BADGE -->
+        <div id="simCapBadge" style="display:none;margin-bottom:16px;background:linear-gradient(135deg,rgba(157,140,255,.08),rgba(34,208,122,.04));border:1px solid rgba(157,140,255,.2);border-radius:12px;padding:16px 20px">
+          <div style="font-size:10px;font-weight:700;letter-spacing:2px;color:var(--accent);margin-bottom:12px">SIMULATION CAPITAL</div>
+          <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:16px">
+            <div>
+              <div style="font-size:10px;color:var(--muted);margin-bottom:4px">INITIAL</div>
+              <div style="font-size:20px;font-weight:700;color:var(--text);font-family:var(--mono)" id="scInitial">0.00 SOL</div>
+              <div style="font-size:11px;color:var(--muted);margin-top:2px" id="scInitialUsd">$0.00</div>
+            </div>
+            <div>
+              <div style="font-size:10px;color:var(--muted);margin-bottom:4px">CURRENT</div>
+              <div style="font-size:20px;font-weight:700;color:var(--text);font-family:var(--mono)" id="scCurrent">0.0000 SOL</div>
+              <div style="font-size:11px;color:var(--muted);margin-top:2px" id="scCurrentUsd">$0.00</div>
+            </div>
+            <div>
+              <div style="font-size:10px;color:var(--muted);margin-bottom:4px">NET P&amp;L</div>
+              <div style="font-size:20px;font-weight:700;font-family:var(--mono)" id="scPnl">+0.0000 SOL</div>
+              <div style="font-size:11px;margin-top:2px" id="scPct">$0.00 · 0.00%</div>
+            </div>
+          </div>
+        </div>
+        <div class="cycle-row">
+          <div class="cycle-card">
+            <div class="cycle-icon" style="background:rgba(157,140,255,.1)">⚙️</div>
+            <div>
+              <div class="cycle-label">Management</div>
+              <div class="cycle-time" id="mTimer">—</div>
+            </div>
+          </div>
+          <div class="cycle-card">
+            <div class="cycle-icon" style="background:rgba(34,208,122,.1)">🔍</div>
+            <div>
+              <div class="cycle-label">Screening</div>
+              <div class="cycle-time" id="sTimer">—</div>
+            </div>
+          </div>
+          <div class="cycle-card">
+            <div class="cycle-icon" style="background:rgba(255,209,102,.1)">📡</div>
+            <div>
+              <div class="cycle-label">Uptime</div>
+              <div class="cycle-time" id="uptime">—</div>
+            </div>
+          </div>
+        </div>
+        <div class="two-col">
+          <div class="card">
+            <div class="card-header"><span class="card-title">Recent Pools</span><span
+                style="font-size:11px;color:var(--muted)" id="poolCnt">—</span></div>
+            <div style="padding:0">
+              <table class="pool-table">
+                <thead>
+                  <tr>
+                    <th>Pool</th>
+                    <th>Vol</th>
+                    <th>Organic</th>
+                    <th>Status</th>
+                  </tr>
+                </thead>
+                <tbody id="poolBody">
+                  <tr>
+                    <td colspan="4" style="text-align:center;color:var(--muted);padding:24px;font-size:12px">Loading...
+                    </td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+          <div style="display:flex;flex-direction:column;gap:12px">
+            <div class="card">
+              <div class="card-header"><span class="card-title">Wallet</span></div>
+              <div class="card-body">
+                <div
+                  style="font-size:10px;color:var(--muted2);font-family:var(--mono);letter-spacing:.06em;margin-bottom:6px">
+                  SOLANA ADDRESS</div>
+                <div class="wallet-addr" id="wAddr">Loading...</div>
+                <div style="margin-top:10px;display:flex;gap:12px">
+                  <a id="scanLink" href="#" target="_blank"
+                    style="font-size:11px;color:var(--accent);text-decoration:none;font-family:var(--mono)">Solscan
+                    →</a>
+                  <a href="https://app.meteora.ag" target="_blank"
+                    style="font-size:11px;color:var(--muted);text-decoration:none;font-family:var(--mono)">Meteora →</a>
+                </div>
+              </div>
+            </div>
+            <div class="card">
+              <div class="card-header"><span class="card-title">This Month</span></div>
+              <div class="card-body">
+                <div class="mrow"><span class="mkey">Total PnL</span><span class="mval g" id="mTotal">0.0000 SOL</span></div>
+                <div class="mrow"><span class="mkey">Best Day</span><span class="mval g" id="mBest">0.0000 SOL</span></div>
+                <div class="mrow"><span class="mkey">Worst Day</span><span class="mval r" id="mWorst">0.0000 SOL</span></div>
+                <div class="mrow"><span class="mkey">Trading Days</span><span class="mval w" id="mDays">0</span></div>
+                <div class="mrow"><span class="mkey">Screenings</span><span class="mval w" id="mScr">0</span></div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- CALENDAR -->
+      <div id="page-calendar" class="page">
+        <div class="page-header">
+          <div>
+            <div class="page-title">PnL Calendar</div>
+            <div class="page-sub">Daily profit & loss</div>
+          </div>
+        </div>
+        <div class="cal-two">
+          <div class="card">
+            <div class="card-body">
+              <div class="cal-hdr">
+                <button class="cal-btn" onclick="prevM()">‹</button>
+                <span class="cal-month-title" id="calT">May 2026</span>
+                <button class="cal-btn" onclick="nextM()">›</button>
+              </div>
+              <div class="cal-grid" id="calG"></div>
+            </div>
+          </div>
+          <div class="card">
+            <div class="card-header"><span class="card-title">Monthly Summary</span></div>
+            <div class="card-body">
+              <div class="mrow"><span class="mkey">Total PnL</span><span class="mval g" id="csT">0.0000 SOL</span></div>
+              <div class="mrow"><span class="mkey">Best Day</span><span class="mval g" id="csB">0.0000 SOL</span></div>
+              <div class="mrow"><span class="mkey">Worst Day</span><span class="mval r" id="csW">0.0000 SOL</span></div>
+              <div class="mrow"><span class="mkey">Trading Days</span><span class="mval w" id="csD">0</span></div>
+              <div
+                style="margin-top:16px;padding:12px;background:rgba(157,140,255,.05);border-radius:8px;border:1px solid rgba(157,140,255,.1)">
+                <div style="font-size:11px;color:var(--muted);margin-bottom:4px">Note</div>
+                <div style="font-size:12px;color:var(--muted)">Calendar akan terisi setelah ada live trading. Sekarang
+                  masih DRY RUN.</div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- POOLS -->
+      <div id="page-pools" class="page">
+        <div class="page-header">
+          <div>
+            <div class="page-title">Pool Candidates</div>
+            <div class="page-sub">Screened every 30 minutes</div>
+          </div>
+          <button class="btn" onclick="loadPools()">↻ Refresh</button>
+        </div>
+        <div class="card">
+          <div style="padding:0">
+            <table class="pool-table">
+              <thead>
+                <tr>
+                  <th>#</th>
+                  <th>Pool</th>
+                  <th>Fee/aTVL</th>
+                  <th>Volume</th>
+                  <th>In-Range</th>
+                  <th>Organic</th>
+                  <th>Status</th>
+                </tr>
+              </thead>
+              <tbody id="poolFull">
+                <tr>
+                  <td colspan="7" style="text-align:center;color:var(--muted);padding:32px;font-size:12px">Loading...
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
+      <!-- LOGS -->
+      <div id="page-logs" class="page">
+        <div class="page-header">
+          <div>
+            <div class="page-title">Log Activity</div>
+            <div class="page-sub">Real-time bot activity</div>
+          </div>
+          <button class="btn" onclick="loadLogs()">↻ Refresh</button>
+        </div>
+        <div class="card">
+          <div class="card-header"><span class="card-title">agent.log</span><span
+              style="font-size:11px;color:var(--muted)" id="logCnt">—</span></div>
+          <div style="padding:8px 0">
+            <div class="log-wrap" id="logW">
+              <div style="color:var(--muted);font-size:12px;text-align:center;padding:20px">Loading...</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+    </main>
+  </div>
+
+  <script>
+    // const API=(location.hostname==='localhost'||location.hostname==='127.0.0.1')?'http://localhost:3001':'';
+    const API = '';
+    let CAL = { year: new Date().getFullYear(), month: new Date().getMonth() };
+    let PNL = {}, startTime = null, mMs = 10 * 60 * 1000, sMs = 30 * 60 * 1000;
+
+    async function get(ep) { const r = await fetch(API + ep); if (!r.ok) throw new Error(r.status); return r.json(); }
+    function x(s) { return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
+    function showErr(m) { const b = document.getElementById('errBox'); if (!b) return; b.textContent = '⚠ ' + m; b.style.display = 'block'; setTimeout(() => b.style.display = 'none', 6000); }
+
+    function go(n, el) {
+      document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
+      document.getElementById('page-' + n).classList.add('active');
+      document.querySelectorAll('.nav-item').forEach(e => e.classList.remove('active'));
+      if (el) el.classList.add('active');
+      if (n === 'calendar') { loadPnl().then(() => renderCal()); }
+      if (n === 'logs') loadLogs();
+      if (n === 'pools') loadPools();
+    }
+
+    async function loadStatus() {
+      try {
+        const d = await get('/api/status');
+        const b = d.bot || {}, w = d.wallet || {};
+        document.getElementById('sDot').className = 'status-dot' + (b.running ? ' live' : ' offline');
+        document.getElementById('sTxt').textContent = b.running ? 'Bot running' : 'Bot offline';
+        document.getElementById('sMode').textContent = b.mode || '—';
+        document.getElementById('modeBadge').textContent = b.mode || '—';
+        document.getElementById('modeBadge').className = 'badge ' + (b.mode === 'DRY RUN' ? 'badge-dry' : 'badge-live');
+        document.getElementById('agentId').textContent = b.agentId ? 'Agent: ' + b.agentId : 'Meridian DLMM Bot';
+        document.getElementById('solBal').textContent = (w.solBalance || 0).toFixed(4) + ' SOL';
+        document.getElementById('solUsd').textContent = '$' + (w.usdValue || 0).toFixed(2);
+        const ts = d.tradeStats || { total: 0, wins: 0, losses: 0, winRate: 0 };
+        document.getElementById('winRate').textContent = ts.total > 0 ? (ts.winRate + '%') : '—';
+        document.getElementById('scrCnt').textContent =
+          ts.total + ' trades · ' + (b.screeningCount || 0) + ' screenings';
+        // Tag warna win rate
+        const wrEl = document.getElementById('winRate');
+        wrEl.className = 'stat-value' + (ts.total === 0 ? '' : ts.winRate >= 60 ? ' green' : ts.winRate >= 40 ? '' : ' red');
+        document.getElementById('wAddr').textContent = w.address || '—';
+        if (w.address) document.getElementById('scanLink').href = 'https://solscan.io/account/' + w.address;
+        const pc = d.positions?.count || 0;
+        document.getElementById('actPools').textContent = pc;
+        document.getElementById('poolSub').textContent = pc > 0 ? pc + ' active' : b.mode === 'DRY RUN' ? 'dry run' : 'no positions';
+        document.getElementById('mScr').textContent = b.screeningCount || 0;
+        if (b.lastStartup && !startTime) startTime = new Date(b.lastStartup).getTime();
+        // SIMULATION CAPITAL BADGE — utama SOL, USD sebagai subtext
+        const sc = d.simCapital;
+        if (sc && b.mode === 'DRY RUN') {
+          document.getElementById('simCapBadge').style.display = 'block';
+          const sp = sc.solPrice || 0;
+          const usd = (sol) => '$' + (sol * sp).toFixed(2);
+          document.getElementById('scInitial').textContent = sc.initial.toFixed(2) + ' SOL';
+          document.getElementById('scInitialUsd').textContent = usd(sc.initial);
+          document.getElementById('scCurrent').textContent = sc.current.toFixed(4) + ' SOL';
+          document.getElementById('scCurrentUsd').textContent = usd(sc.current);
+          const pnl = sc.pnl || 0;
+          const pnlUsd = sc.pnlUsd || 0;
+          const pct = sc.initial > 0 ? (pnl / sc.initial * 100) : 0;
+          const pnlEl = document.getElementById('scPnl');
+          const pctEl = document.getElementById('scPct');
+          pnlEl.textContent = (pnl >= 0 ? '+' : '-') + Math.abs(pnl).toFixed(4) + ' SOL';
+          pnlEl.style.color = pnl > 0 ? 'var(--green)' : pnl < 0 ? 'var(--red)' : 'var(--muted)';
+          const usdStr = (pnlUsd >= 0 ? '+$' : '-$') + Math.abs(pnlUsd).toFixed(2);
+          const pctStr = (pct >= 0 ? '+' : '') + pct.toFixed(2) + '%';
+          pctEl.textContent = usdStr + ' · ' + pctStr;
+          pctEl.style.color = pnlEl.style.color;
+        }
+      } catch (e) { showErr('Cannot reach backend — run: npm start in D:\\meridian-bot\\pool-dashboard'); }
+    }
+
+    async function loadPnl() {
+      try {
+        const d = await get('/api/pnl');
+        PNL = d.daily || {};
+        const s = d.summary || {}, p = s.total || 0;
+        const pu = s.totalUsd || 0;
+        const ps = (p >= 0 ? '+' : '-') + Math.abs(p).toFixed(4) + ' SOL';
+        const psUsd = (pu >= 0 ? '+$' : '-$') + Math.abs(pu).toFixed(2);
+        document.getElementById('monthPnl').textContent = ps;
+        document.getElementById('monthPnl').className = 'stat-value ' + (p >= 0 ? 'green' : 'red');
+        document.getElementById('tDays').textContent = psUsd + ' · ' + (s.tradingDays || 0) + ' trading days';
+        document.getElementById('mTotal').textContent = ps;
+        document.getElementById('mTotal').className = 'mval ' + (p >= 0 ? 'g' : 'r');
+        document.getElementById('mBest').textContent = '+' + (s.best || 0).toFixed(4) + ' SOL';
+        document.getElementById('mWorst').textContent = '-' + Math.abs(s.worst || 0).toFixed(4) + ' SOL';
+        document.getElementById('mDays').textContent = s.tradingDays || 0;
+      } catch (e) { }
+    }
+
+    async function loadPools() {
+      try {
+        const d = await get('/api/pools');
+        const cands = d.candidates || [], dropped = d.dropped || [];
+        document.getElementById('poolCnt').textContent = cands.length + ' candidates, ' + dropped.length + ' dropped';
+        const all = [...cands, ...dropped.slice(0, 4)];
+        const tb = document.getElementById('poolBody');
+        tb.innerHTML = all.length === 0
+          ? '<tr><td colspan="4" style="text-align:center;color:var(--muted);padding:24px;font-size:12px">Waiting for screening cycle...</td></tr>'
+          : all.map(p => {
+            const isDrop = p.status === 'dropped' || !p.organic;
+            return `<tr>
+          <td><div class="pool-name">${x(p.name || '—')}</div>${p.reason ? `<div style="font-size:10px;color:var(--red);margin-top:1px">${x(p.reason)}</div>` : `<div class="pool-sub">${p.feeAtvl || '—'}</div>`}</td>
+          <td style="font-family:var(--mono);font-size:12px">${p.vol || '—'}</td>
+          <td>${!isDrop && p.organic > 0 ? `<div class="obar"><div class="bar-bg"><div class="bar-fill ${p.organic >= 80 ? 'high' : 'low'}" style="width:${p.organic}%"></div></div><span style="font-family:var(--mono);font-size:11px;min-width:22px">${p.organic}</span></div>` : '<span style="color:var(--muted2)">—</span>'}</td>
+          <td><span class="tag ${isDrop ? 'tag-d' : 'tag-c'}">${isDrop ? 'dropped' : 'candidate'}</span></td>
+        </tr>`;
+          }).join('');
+        const tf = document.getElementById('poolFull');
+        if (!cands.length && !dropped.length) { tf.innerHTML = '<tr><td colspan="7" style="text-align:center;color:var(--muted);padding:32px;font-size:12px">No pool data yet</td></tr>'; return; }
+        let h = '';
+        if (cands.length) { h += `<tr><td colspan="7" class="sec-sep">✓ Eligible Candidates (${cands.length})</td></tr>`; cands.forEach((p, i) => h += pr(p, i + 1, 'c')); }
+        if (dropped.length) { h += `<tr><td colspan="7" class="sec-sep">✗ Dropped by Filter (${dropped.length})</td></tr>`; dropped.forEach((p, i) => h += pr(p, cands.length + i + 1, 'd')); }
+        tf.innerHTML = h;
+      } catch (e) { console.error('pools:', e); }
+    }
+
+    function pr(p, i, s) {
+      const ts = p.ts ? new Date(p.ts).toLocaleTimeString('id-ID', { hour12: false }) : '';
+      return `<tr>
+    <td style="color:var(--muted2);font-family:var(--mono);font-size:11px">${i}</td>
+    <td><div class="pool-name">${x(p.name || '—')}</div>${p.reason ? `<div style="font-size:10px;color:var(--red);margin-top:2px">${x(p.reason)}</div>` : ''}${ts ? `<div style="font-size:10px;color:var(--muted2);margin-top:2px">${ts}</div>` : ''}</td>
+    <td style="font-family:var(--mono);font-size:12px">${p.feeAtvl || '—'}</td>
+    <td style="font-family:var(--mono);font-size:12px">${p.vol || '—'}</td>
+    <td style="font-family:var(--mono);font-size:12px">${p.inRange || '—'}</td>
+    <td>${s === 'c' && p.organic > 0 ? `<div class="obar"><div class="bar-bg"><div class="bar-fill ${p.organic >= 80 ? 'high' : 'low'}" style="width:${p.organic}%"></div></div><span style="font-family:var(--mono);font-size:11px;min-width:22px">${p.organic}</span></div>` : '<span style="color:var(--muted2)">—</span>'}</td>
+    <td><span class="tag ${s === 'c' ? 'tag-c' : 'tag-d'}">${s === 'c' ? 'candidate' : 'dropped'}</span></td>
+  </tr>`;
+    }
+
+    const SKIP = new Set(['POSITIONS']);
+    const KT = ['STARTUP', 'CRON', 'ERROR', 'CRON_ERROR', 'HIVEMIND_WARN', 'SCREENING', 'AGENT', 'INIT', 'SHUTDOWN'];
+
+    async function loadLogs() {
+      try {
+        const d = await get('/api/logs?limit=200');
+        const logs = d.logs || [];
+        document.getElementById('logCnt').textContent = (d.total || 0) + ' lines total';
+        const w = document.getElementById('logW');
+        const fl = logs.filter(l => !SKIP.has(l.tag));
+        if (!fl.length) { w.innerHTML = '<div style="color:var(--muted);font-size:12px;text-align:center;padding:20px">No logs to show</div>'; return; }
+        w.innerHTML = fl.map(l => {
+          const isE = l.tag && l.tag.includes('ERROR'), isW = l.tag && l.tag.includes('WARN');
+          const t = l.ts ? new Date(l.ts).toLocaleTimeString('id-ID', { hour12: false }) : '—';
+          const tc = KT.includes(l.tag) ? 'lt-' + l.tag : 'lt-other';
+          return `<div class="log-line"><span class="log-time">${t}</span><span class="log-tag ${tc}">${x(l.tag || 'INFO')}</span><span class="log-msg ${isE ? 'err' : isW ? 'warn' : ''}">${x(l.msg || '')}</span></div>`;
+        }).join('');
+        w.scrollTop = w.scrollHeight;
+      } catch (e) { document.getElementById('logW').innerHTML = '<div style="color:var(--red);font-size:12px;text-align:center;padding:20px">Error loading logs</div>'; }
+    }
+
+    const MO = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
+    const DA = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+
+    function renderCal() {
+      const y = CAL.year, m = CAL.month;
+      document.getElementById('calT').textContent = MO[m] + ' ' + y;
+      const g = document.getElementById('calG');
+      g.innerHTML = DA.map(d => `<div class="cdl">${d}</div>`).join('');
+      const off = (new Date(y, m, 1).getDay() + 6) % 7;
+      const days = new Date(y, m + 1, 0).getDate();
+      const today = new Date();
+      for (let i = 0; i < off; i++)g.innerHTML += '<div class="cd"></div>';
+      let tot = 0, best = -Infinity, worst = Infinity, td = 0;
+      for (let d = 1; d <= days; d++) {
+        const k = `${y}-${String(m + 1).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
+        const p = PNL[k];
+        const isTd = today.getFullYear() === y && today.getMonth() === m && today.getDate() === d;
+        const isPast = new Date(y, m, d) < today && d < today.getDate();
+        let cls = 'cd', ps = '';
+        if (p > 0) { cls += ' profit'; ps = '+' + p.toFixed(3); tot += p; if (p > best) best = p; td++; }
+        else if (p < 0) { cls += ' loss'; ps = p.toFixed(3); tot += p; if (p < worst) worst = p; td++; }
+        else if (isPast) cls += ' zero';
+        if (isTd) cls += ' today';
+        g.innerHTML += `<div class="${cls}"><div class="cdn">${d}</div><div class="cdp">${ps}</div></div>`;
+      }
+      document.getElementById('csT').textContent = (tot >= 0 ? '+' : '') + tot.toFixed(4) + ' SOL';
+      document.getElementById('csT').className = 'mval ' + (tot >= 0 ? 'g' : 'r');
+      document.getElementById('csB').textContent = best > -Infinity ? '+' + best.toFixed(4) + ' SOL' : '0.0000 SOL';
+      document.getElementById('csW').textContent = worst < Infinity ? worst.toFixed(4) + ' SOL' : '0.0000 SOL';
+      document.getElementById('csD').textContent = td;
+    }
+
+    function prevM() { CAL.month--; if (CAL.month < 0) { CAL.month = 11; CAL.year--; } renderCal(); }
+    function nextM() { CAL.month++; if (CAL.month > 11) { CAL.month = 0; CAL.year++; } renderCal(); }
+    function fmt(ms) { if (ms <= 0) return '00:00'; const m = Math.floor(ms / 60000), s = Math.floor((ms % 60000) / 1000); return String(m).padStart(2, '0') + ':' + String(s).padStart(2, '0'); }
+    function fmtU(ms) { const h = Math.floor(ms / 3600000), m = Math.floor((ms % 3600000) / 60000), s = Math.floor((ms % 60000) / 1000); return String(h).padStart(2, '0') + ':' + String(m).padStart(2, '0') + ':' + String(s).padStart(2, '0'); }
+
+    setInterval(() => {
+      mMs = Math.max(0, mMs - 1000); sMs = Math.max(0, sMs - 1000);
+      if (mMs === 0) mMs = 10 * 60 * 1000;
+      if (sMs === 0) { sMs = 30 * 60 * 1000; loadPools(); }
+      document.getElementById('mTimer').textContent = fmt(mMs);
+      document.getElementById('sTimer').textContent = fmt(sMs);
+      if (startTime) document.getElementById('uptime').textContent = fmtU(Date.now() - startTime);
+    }, 1000);
+
+    async function loadAll() { await Promise.all([loadStatus(), loadPnl(), loadPools()]); }
+    loadAll();
+    setInterval(loadAll, 30000);
+  </script>
+</body>
+
+</html>
