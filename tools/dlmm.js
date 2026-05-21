@@ -25,7 +25,7 @@ import {
 } from "../state.js";
 import { recordPerformance } from "../lessons.js";
 import { isBaseMintOnCooldown, isPoolOnCooldown } from "../pool-memory.js";
-import { normalizeMint } from "./wallet.js";
+import { normalizeMint, getWalletBalances } from "./wallet.js";
 import { appendDecision } from "../decision-log.js";
 import { agentMeridianJson, getAgentIdForRequests, getAgentMeridianHeaders } from "./agent-meridian.js";
 
@@ -542,6 +542,22 @@ export async function deployPosition({
     throw new Error("Invalid deploy amount: provide a positive amount_y/amount_sol.");
   }
   const isSingleSidedSol = finalAmountX <= 0 && finalAmountY > 0;
+
+  // P0: Verify tokenY is SOL/wSOL before single-side SOL deploy.
+  // Hard-coding 1e9 is only safe when tokenY is confirmed to be SOL (decimals=9).
+  // Reject early if pool tokenY is something else (e.g. USDC=6 decimals would cause
+  // a 1000× nominal error).
+  if (isSingleSidedSol) {
+    const SOL_MINT = "So11111111111111111111111111111111111111112";
+    const tokenYMint = pool.lbPair.tokenYMint.toString();
+    if (tokenYMint !== SOL_MINT) {
+      throw new Error(
+        `Single-side SOL deploy requires tokenY to be SOL/wSOL. ` +
+        `Got tokenY=${tokenYMint}. Refusing deploy to avoid decimal mismatch.`
+      );
+    }
+  }
+
   if (isSingleSidedSol && (Number(bins_above ?? 0) > 0 || Number(upside_pct ?? 0) > 0)) {
     throw new Error(
       "Single-side SOL deploy cannot use bins_above or upside_pct. Use amount_y with bins_below only; the upper bin is the SDK active bin.",
@@ -792,7 +808,7 @@ export async function deployPosition({
         totalXAmount: totalXLamports,
         totalYAmount: totalYLamports,
         strategy: { minBinId, maxBinId, strategyType },
-        slippage: 10, // 10%
+        slippage: 1000, // 10% in bps — same unit as standard path
       });
       const addTxArray = Array.isArray(addTxs) ? addTxs : [addTxs];
       for (let i = 0; i < addTxArray.length; i++) {
@@ -1431,7 +1447,32 @@ export async function closePosition({ position_address, reason }) {
       const livePosition = livePositions?.positions?.find((position) => position.position === position_address);
       const closeFromBinId = livePosition?.lower_bin ?? tracked?.bin_range?.min ?? -887272;
       const closeToBinId = livePosition?.upper_bin ?? tracked?.bin_range?.max ?? 887272;
-      const closeOutput = "allToken1";
+      // P1: Determine close output based on which token is SOL — not hard-coded to token1.
+      // allToken0 if tokenX is SOL, allToken1 if tokenY is SOL.
+      const _closeTokenXMint = pool.lbPair.tokenXMint.toString();
+      const _closeTokenYMint = pool.lbPair.tokenYMint.toString();
+      const SOL_MINT = "So11111111111111111111111111111111111111112";
+      let closeOutput;
+      if (_closeTokenXMint === SOL_MINT) {
+        closeOutput = "allToken0";
+      } else if (_closeTokenYMint === SOL_MINT) {
+        closeOutput = "allToken1";
+      } else {
+        throw new Error(
+          `Cannot determine close output: neither tokenX (${_closeTokenXMint.slice(0, 8)}) ` +
+          `nor tokenY (${_closeTokenYMint.slice(0, 8)}) is SOL. Cannot auto-close to SOL.`
+        );
+      }
+
+      // P0: Cap relay close slippage at 500 bps (5%) max — 5000 bps (50%) is dangerously high.
+      // Configurable via config.management.closeSlippageBps, default 300 bps (3%).
+      const closeSlippageBps = Math.min(
+        Math.max(1, Number(config.management?.closeSlippageBps ?? 300)),
+        500
+      );
+      if (!Number.isFinite(closeSlippageBps)) {
+        throw new Error("Invalid closeSlippageBps — must be a finite number.");
+      }
 
       const order = await agentMeridianJson("/execution/zap-out/order", {
         method: "POST",
@@ -1442,7 +1483,7 @@ export async function closePosition({ position_address, reason }) {
           positionId: position_address,
           owner: wallet.publicKey.toString(),
           bps: 10000,
-          slippageBps: 5000,
+          slippageBps: closeSlippageBps,
           output: closeOutput,
           provider: "OKX",
           type: "meteora",
@@ -1508,9 +1549,12 @@ export async function closePosition({ position_address, reason }) {
       }
 
       if (!closedConfirmed) {
+        // P1: Tx was already submitted — don't return success:false which implies a hard failure.
+        // Return a distinct status so the caller knows not to retry the close.
         return {
-          success: false,
-          error: "Close submit succeeded but position still appears open after verification window",
+          success: null,
+          status: "submitted_unconfirmed",
+          warning: "Close tx submitted but position still appears open in portfolio API — may still be settling.",
           position: position_address,
           pool: poolAddress,
           close_txs: closeTxHashes,
@@ -1738,9 +1782,13 @@ export async function closePosition({ position_address, reason }) {
     }
 
     if (!closedConfirmed) {
+      // P1: Txs were sent on-chain — return submitted_unconfirmed, not success:false.
+      // Prevents the manager from treating a submitted close as a hard failure
+      // and attempting a duplicate close or making wrong decisions.
       return {
-        success: false,
-        error: "Close transactions sent but position still appears open after verification window",
+        success: null,
+        status: "submitted_unconfirmed",
+        warning: "Close txs sent but position still appears open in portfolio API — may still be settling.",
         position: position_address,
         pool: poolAddress,
         claim_txs: claimTxHashes,
