@@ -21,7 +21,7 @@ const TIMEFRAME_MINUTES = {
   "12h": 720,
   "24h": 1440,
 };
-const PVP_SHORTLIST_LIMIT = 2;
+const PVP_SHORTLIST_LIMIT = 30;
 const PVP_RIVAL_LIMIT = 2;
 const PVP_MIN_ACTIVE_TVL = 5_000;
 const PVP_MIN_HOLDERS = 500;
@@ -77,7 +77,7 @@ function normalizeScreeningConfig(raw = {}) {
   if (!TIMEFRAME_MINUTES[timeframe]) {
     throw new Error(`Invalid screening config: timeframe=${timeframe} (valid: ${Object.keys(TIMEFRAME_MINUTES).join(", ")})`);
   }
-  return {
+  const cfg = {
     ...raw,
     timeframe,
     minMcap:              req("minMcap",              raw.minMcap),
@@ -92,6 +92,21 @@ function normalizeScreeningConfig(raw = {}) {
     minOrganic:           req("minOrganic",            raw.minOrganic),
     minQuoteOrganic:      req("minQuoteOrganic",       raw.minQuoteOrganic),
   };
+  // Relational validation — catch inverted ranges before they silently return 0 results
+  if (cfg.maxMcap != null && cfg.maxMcap < cfg.minMcap)
+    throw new Error(`Invalid screening config: maxMcap (${cfg.maxMcap}) < minMcap (${cfg.minMcap})`);
+  if (cfg.maxTvl != null && cfg.maxTvl < cfg.minTvl)
+    throw new Error(`Invalid screening config: maxTvl (${cfg.maxTvl}) < minTvl (${cfg.minTvl})`);
+  if (cfg.maxBinStep < cfg.minBinStep)
+    throw new Error(`Invalid screening config: maxBinStep (${cfg.maxBinStep}) < minBinStep (${cfg.minBinStep})`);
+  return cfg;
+}
+
+// ── Safe limit normalizer ─────────────────────────────────────────────────────
+function normalizeLimit(limit, fallback = 10, max = 50) {
+  const n = Number(limit);
+  if (!Number.isInteger(n) || n <= 0) return fallback;
+  return Math.min(n, max);
 }
 
 // ── fetch helper dengan timeout + retry ──────────────────────────────────────
@@ -235,7 +250,7 @@ async function fetchPoolDiscoveryPage({ page_size, filters, timeframe, category 
     `page_size=${page_size}` +
     `&filter_by=${encodeURIComponent(filters)}` +
     `&timeframe=${timeframe}` +
-    (category ? `&category=${category}` : "");
+    (category ? `&category=${encodeURIComponent(category)}` : "");
 
   return fetchJson(url);
 }
@@ -246,7 +261,7 @@ async function fetchPoolDiscoveryDetail({ poolAddress, timeframe, category }) {
     `page_size=1` +
     `&filter_by=${encodeURIComponent(`pool_address=${poolAddress}`)}` +
     `&timeframe=${timeframe}` +
-    (cat ? `&category=${cat}` : "");
+    (cat ? `&category=${encodeURIComponent(cat)}` : "");
 
   const data = await fetchJson(url);
   return (data.data || [])[0] ?? null;
@@ -516,7 +531,7 @@ export async function discoverPools({
     }
     return true;
   });
-  const afterBlacklist = pools.length;
+  const afterInitialBlacklist = pools.length;
 
   const blFiltered = condensed.length - pools.length;
   if (blFiltered > 0) log("blacklist", `Filtered ${blFiltered} pool(s) with blacklisted tokens/devs`);
@@ -548,18 +563,22 @@ export async function discoverPools({
         if (dev) p.dev = dev; // enrich in-place
         if (dev && isDevBlocked(dev)) {
           log("dev_blocklist", `Filtered blocked deployer (jup) ${dev.slice(0, 8)} token ${p.base?.symbol}`);
+          filteredExamples.push({ name: p.name, reason: "blocked deployer (Jupiter lookup)" });
           return false;
         }
         return true;
       });
     }
   }
+  // Count AFTER Jupiter dev enrichment (more accurate than afterInitialBlacklist)
+  const afterBlacklist = pools.length;
 
   return {
     api_total:        data.total,    // what the API says it has
     raw_count:        rawCount,      // how many came back in this page
     threshold_passed: thresholdPassed,
-    after_blacklist:  afterBlacklist,
+    after_blacklist:  afterBlacklist,        // after all blacklist/dev checks
+    after_initial_blacklist: afterInitialBlacklist, // before Jupiter dev enrichment
     pools,
     filtered_examples: filteredExamples,
   };
@@ -571,6 +590,8 @@ export async function discoverPools({
  */
 export async function getTopCandidates({ limit = 10 } = {}) {
   const { config } = await import("../config.js");
+  const safeLimit = normalizeLimit(limit);
+  const s = normalizeScreeningConfig(config.screening);
   const discovery = await discoverPools({ page_size: 50 });
   const { pools } = discovery;
   const filteredOut = Array.isArray(discovery.filtered_examples) ? [...discovery.filtered_examples] : [];
@@ -589,9 +610,9 @@ export async function getTopCandidates({ limit = 10 } = {}) {
   }
   const occupiedPools = new Set(positions.map((p) => p.pool));
   const occupiedMints = new Set(positions.map((p) => p.base_mint).filter(Boolean));
-  const minTvl = Number(config.screening.minTvl ?? 0);
-  const maxTvl = config.screening.maxTvl == null ? null : Number(config.screening.maxTvl);
-  const minFeeActiveTvlRatio = Number(config.screening.minFeeActiveTvlRatio ?? 0);
+  const minTvl = s.minTvl;
+  const maxTvl = s.maxTvl;
+  const minFeeActiveTvlRatio = s.minFeeActiveTvlRatio;
 
   const eligible = pools
     .filter((p) => {
@@ -635,8 +656,8 @@ export async function getTopCandidates({ limit = 10 } = {}) {
     })
     .sort((a, b) => scoreCandidate(b) - scoreCandidate(a))
     // Take a wide shortlist so OKX/indicator filters can trim without running out of candidates.
-    // Final trim to `limit` happens after pool_score ranking below.
-    .slice(0, Math.max(limit * 3, 30));
+    // Final trim to `safeLimit` happens after pool_score ranking below.
+    .slice(0, Math.max(safeLimit * 3, 30));
 
   if (config.screening.avoidPvpSymbols && eligible.length > 0) {
     await enrichPvpRisk(eligible);
@@ -708,6 +729,34 @@ export async function getTopCandidates({ limit = 10 } = {}) {
         eligible[i].top_cluster_hold_pct = clusters[0]?.holding_pct ?? null;
       }
     }
+    // ── OKX fail-closed for live mode ───────────────────────────────────────
+    // dry-run defaults to fail-open (don't block testing); live defaults to fail-closed
+    const isDryRun = config.dryRun === true || process.env.DRY_RUN === "true";
+    const failOpenRisk = config.screening.failOpenOnRiskDataUnavailable ?? isDryRun;
+    if (!failOpenRisk) {
+      const riskMissingBefore = eligible.length;
+      eligible.splice(0, eligible.length, ...eligible.filter((p, i) => {
+        const r = okxResults[i];
+        if (r.status !== "fulfilled") {
+          pushFilteredReason(filteredOut, p, "OKX data fetch failed");
+          return false;
+        }
+        const { adv, risk } = r.value;
+        if (!adv) {
+          pushFilteredReason(filteredOut, p, "OKX advanced risk unavailable");
+          return false;
+        }
+        if (!risk) {
+          pushFilteredReason(filteredOut, p, "OKX risk flags unavailable");
+          return false;
+        }
+        return true;
+      }));
+      if (eligible.length < riskMissingBefore) {
+        log("screening", `OKX fail-closed: removed ${riskMissingBefore - eligible.length} pool(s) with unavailable risk data`);
+      }
+    }
+
     // Wash trading hard filter — fake volume = misleading fee yield
     eligible.splice(0, eligible.length, ...eligible.filter((p) => {
       if (p.is_wash) {
@@ -837,17 +886,25 @@ export async function getTopCandidates({ limit = 10 } = {}) {
   if (eligible.length > 0) {
     const darwinW = await loadDarwinScorerWeights();
     const scorerWeights = applyDarwinWeights(darwinW);
+    const scoredEligible = [];
     for (const pool of eligible) {
-      const scored = scorePool(pool, scorerWeights);
-      pool.pool_score         = scored.score;
-      pool.pool_grade         = scored.grade;
-      pool.pool_recommendation = scored.recommendation;
-      pool.volatility_zone    = scored.volatility_zone;
-      pool.score_breakdown    = scored.breakdown;
+      try {
+        const scored = scorePool(pool, scorerWeights);
+        pool.pool_score          = scored.score;
+        pool.pool_grade          = scored.grade;
+        pool.pool_recommendation = scored.recommendation;
+        pool.volatility_zone     = scored.volatility_zone;
+        pool.score_breakdown     = scored.breakdown;
+        scoredEligible.push(pool);
+      } catch (err) {
+        log("screening", `Pool scorer failed for ${pool.name}: ${err.message}`);
+        pushFilteredReason(filteredOut, pool, `pool scorer error: ${err.message}`);
+      }
     }
+    eligible.splice(0, eligible.length, ...scoredEligible);
     eligible.sort((a, b) => (b.pool_score ?? 0) - (a.pool_score ?? 0));
     // Final trim to requested limit — done here, AFTER all risk/indicator filters
-    eligible.splice(limit);
+    eligible.splice(safeLimit);
     log("screening", `Pool-scorer ranked ${eligible.length} candidate(s) — top score: ${eligible[0]?.pool_score ?? 0}`);
     eligible.forEach((pool, i) => {
       const feeAtvl = ((Number(pool.fee_active_tvl_ratio)||0)*100).toFixed(3)+'%';
