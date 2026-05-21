@@ -101,6 +101,23 @@ function recordProviderFailure(provider) {
   _providerHealth.set(provider, h);
 }
 
+/**
+ * Wrap a single OKX endpoint call with per-endpoint circuit tracking.
+ * Returns null (fulfilled) when circuit is open — callers treat this the same
+ * as a failed fetch, without adding noise to logs.
+ */
+async function callOkxEndpoint(endpointKey, fn) {
+  if (isCircuitOpen(endpointKey)) return null; // silently skip — circuit already logged on open
+  try {
+    const result = await fn();
+    recordProviderSuccess(endpointKey);
+    return result;
+  } catch (err) {
+    recordProviderFailure(endpointKey);
+    throw err; // re-throw so Promise.allSettled records status "rejected"
+  }
+}
+
 // ── OKX per-mint cache — TTL 5 min — avoids re-enriching same mint every cycle ──
 const OKX_CACHE_TTL_MS = 5 * 60 * 1000;
 const OKX_CACHE_MAX    = 300; // cap entries; oldest evicted on overflow
@@ -113,7 +130,14 @@ function getOkxCached(mint) {
 }
 
 function setOkxCached(mint, data) {
-  if (_okxCache.size >= OKX_CACHE_MAX) _okxCache.delete(_okxCache.keys().next().value);
+  if (_okxCache.size >= OKX_CACHE_MAX) {
+    // Lazy sweep: evict any expired entry before falling back to oldest-entry eviction
+    const now = Date.now();
+    for (const [k, v] of _okxCache) {
+      if (now - v.ts >= OKX_CACHE_TTL_MS) { _okxCache.delete(k); break; }
+    }
+    if (_okxCache.size >= OKX_CACHE_MAX) _okxCache.delete(_okxCache.keys().next().value);
+  }
   _okxCache.set(mint, { data, ts: Date.now() });
 }
 
@@ -471,9 +495,15 @@ async function cachedSearchAssetsBySymbol(symbol) {
   const entry = _pvpSymbolCache.get(symbol);
   if (entry && Date.now() - entry.ts < PVP_SYMBOL_CACHE_TTL_MS) return entry.assets;
   const assets = await searchAssetsBySymbol(symbol).catch(() => []);
-  // Evict oldest on overflow before inserting (Map preserves insertion order)
   if (_pvpSymbolCache.size >= PVP_SYMBOL_CACHE_MAX) {
-    _pvpSymbolCache.delete(_pvpSymbolCache.keys().next().value);
+    // Lazy sweep: prefer evicting an expired entry over the oldest live one
+    const now = Date.now();
+    for (const [k, v] of _pvpSymbolCache) {
+      if (now - v.ts >= PVP_SYMBOL_CACHE_TTL_MS) { _pvpSymbolCache.delete(k); break; }
+    }
+    if (_pvpSymbolCache.size >= PVP_SYMBOL_CACHE_MAX) {
+      _pvpSymbolCache.delete(_pvpSymbolCache.keys().next().value);
+    }
   }
   _pvpSymbolCache.set(symbol, { assets, ts: Date.now() });
   return assets;
@@ -788,10 +818,10 @@ export async function getTopCandidates({ limit = 10 } = {}) {
   }
 
   // Enrich with OKX data — advanced info (risk/bundle/sniper) + ATH price (no API key required)
+  // Per-endpoint circuit breakers (okx:advanced / okx:price / okx:cluster / okx:risk) open
+  // independently after CIRCUIT_FAILURE_THRESHOLD consecutive failures for that endpoint,
+  // so a single unstable endpoint doesn't kill the rest of the OKX layer.
   if (eligible.length > 0) {
-    if (isCircuitOpen("okx")) {
-      log("screening", `OKX circuit breaker open — skipping enrichment this cycle`);
-    } else {
     const { getAdvancedInfo, getPriceInfo, getClusterList, getRiskFlags } = await import("./okx.js");
     const okxResults = await mapWithConcurrency(eligible, 5, async (p) => {
       if (!p.base?.mint) return { adv: null, price: null, clusters: [], risk: null };
@@ -801,10 +831,10 @@ export async function getTopCandidates({ limit = 10 } = {}) {
       if (cached) return cached;
 
       const [adv, price, clusters, risk] = await Promise.allSettled([
-        getAdvancedInfo(p.base.mint),
-        getPriceInfo(p.base.mint),
-        getClusterList(p.base.mint),
-        getRiskFlags(p.base.mint),
+        callOkxEndpoint("okx:advanced", () => getAdvancedInfo(p.base.mint)),
+        callOkxEndpoint("okx:price",    () => getPriceInfo(p.base.mint)),
+        callOkxEndpoint("okx:cluster",  () => getClusterList(p.base.mint)),
+        callOkxEndpoint("okx:risk",     () => getRiskFlags(p.base.mint)),
       ]);
 
       const mintShort = p.base.mint.slice(0, 8);
@@ -823,14 +853,6 @@ export async function getTopCandidates({ limit = 10 } = {}) {
       if (result.adv || result.price || result.risk) setOkxCached(p.base.mint, result);
       return result;
     });
-
-    // Track circuit breaker health: if majority of calls failed, open the circuit
-    const okxFails = okxResults.filter((r) => r.status !== "fulfilled").length;
-    if (okxFails > 0 && okxFails >= Math.ceil(okxResults.length / 2)) {
-      recordProviderFailure("okx");
-    } else if (okxResults.some((r) => r.status === "fulfilled")) {
-      recordProviderSuccess("okx");
-    }
     for (let i = 0; i < eligible.length; i++) {
       const r = okxResults[i];
       if (r.status !== "fulfilled") continue;
@@ -1006,7 +1028,6 @@ export async function getTopCandidates({ limit = 10 } = {}) {
     if (eligible.length < riskBefore) {
       log("screening", `Hard risk filter removed ${riskBefore - eligible.length} pool(s)`);
     }
-    } // end else (okx circuit not open)
   }
 
   if (config.indicators.enabled && eligible.length > 0) {
