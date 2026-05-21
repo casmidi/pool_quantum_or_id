@@ -257,7 +257,16 @@ function calcDailyPnl(decisions) {
 
 function calcPnlSummary(config = {}) {
   const pnl = readJSON(PATHS.pnlLog, { trades: [] });
-  const trades = pnl.trades || [];
+  const allTrades = pnl.trades || [];
+  // In LIVE mode only count real trades; in dry-run only count simulated trades
+  // Check user-config first, then fallback to .env (mirrors config.js logic)
+  const dotenvForMode = readDotenv(PATHS.dotenv);
+  const isLiveMode = config.dryRun !== undefined
+    ? (config.dryRun === false || config.dryRun === "false")
+    : dotenvForMode.DRY_RUN !== "true";
+  const trades = isLiveMode
+    ? allTrades.filter(t => !t.is_dry_run)
+    : allTrades.filter(t => t.is_dry_run !== false);
   const closed = trades.filter(t => t.status === "closed");
   const open = trades.filter(t => t.status === "open");
   const configuredInitial = Number(config.dry_run_wallet ?? config.dryRunWallet);
