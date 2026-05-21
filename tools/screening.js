@@ -21,7 +21,7 @@ const TIMEFRAME_MINUTES = {
   "12h": 720,
   "24h": 1440,
 };
-const PVP_SHORTLIST_LIMIT = 30;
+// PVP_SHORTLIST_LIMIT removed — enrichPvpRisk now accepts an explicit limit param
 const PVP_RIVAL_LIMIT = 2;
 const PVP_MIN_ACTIVE_TVL = 5_000;
 const PVP_MIN_HOLDERS = 500;
@@ -109,7 +109,17 @@ function normalizeLimit(limit, fallback = 10, max = 50) {
   return Math.min(n, max);
 }
 
+// ── Optional-with-default number validator — throws if value is non-numeric ──
+function requiredFinite(name, value, fallback) {
+  const raw = value ?? fallback;
+  const n = Number(raw);
+  if (!Number.isFinite(n)) throw new Error(`Invalid screening config: ${name}=${raw}`);
+  return n;
+}
+
 // ── fetch helper dengan timeout + retry ──────────────────────────────────────
+// Only 408/429/5xx and network errors are retried; 4xx client errors are thrown immediately.
+const RETRYABLE_STATUS = new Set([408, 429, 500, 502, 503, 504]);
 async function fetchJson(url, { timeoutMs = 8000, retries = 2, headers } = {}) {
   let lastError;
   for (let attempt = 0; attempt <= retries; attempt++) {
@@ -118,11 +128,19 @@ async function fetchJson(url, { timeoutMs = 8000, retries = 2, headers } = {}) {
     try {
       const res = await fetch(url, { headers, signal: controller.signal });
       clearTimeout(timer);
-      if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+      if (!res.ok) {
+        const err = new Error(`${res.status} ${res.statusText}`);
+        err.status = res.status;
+        // Non-retryable client errors — bail immediately, no point retrying
+        if (res.status >= 400 && res.status < 500 && !RETRYABLE_STATUS.has(res.status)) throw err;
+        throw err;
+      }
       return await res.json();
     } catch (err) {
       clearTimeout(timer);
       lastError = err;
+      // Don't retry if server said it's a client error (e.g. 400/401/403/404)
+      if (err.status && err.status >= 400 && err.status < 500 && !RETRYABLE_STATUS.has(err.status)) break;
       if (attempt === retries) break;
       await new Promise((r) => setTimeout(r, 500 * (attempt + 1)));
     }
@@ -368,10 +386,10 @@ async function findRivalPool(mint) {
   return pools.find((pool) => pool?.token_x?.address === mint || pool?.token_y?.address === mint) || null;
 }
 
-async function enrichPvpRisk(pools) {
+async function enrichPvpRisk(pools, { limit = pools.length } = {}) {
   const shortlist = [...pools]
     .sort((a, b) => scoreCandidate(b) - scoreCandidate(a))
-    .slice(0, PVP_SHORTLIST_LIMIT);
+    .slice(0, Math.min(limit, pools.length));
 
   if (shortlist.length === 0) return;
 
@@ -425,6 +443,7 @@ async function enrichPvpRisk(pools) {
 export async function discoverPools({
   page_size = 50,
 } = {}) {
+  const safePageSize = normalizeLimit(page_size, 50, 100);
   const s = normalizeScreeningConfig(config.screening);
   const filters = [
     "base_token_has_critical_warnings=false",
@@ -451,7 +470,7 @@ export async function discoverPools({
   ].filter(Boolean).join("&&");
 
   const data = await fetchPoolDiscoveryPage({
-    page_size,
+    page_size: safePageSize,
     filters,
     timeframe: s.timeframe,
     category: s.category,
@@ -660,7 +679,10 @@ export async function getTopCandidates({ limit = 10 } = {}) {
     .slice(0, Math.max(safeLimit * 3, 30));
 
   if (config.screening.avoidPvpSymbols && eligible.length > 0) {
-    await enrichPvpRisk(eligible);
+    // Check ALL eligible candidates — post-OKX/scorer ranking can promote any of them to final
+    await enrichPvpRisk(eligible, {
+      limit: Number(config.screening.pvpCheckLimit ?? eligible.length),
+    });
     if (config.screening.blockPvpSymbols) {
       const before = eligible.length;
       const pvpRemoved = eligible.filter((p) => p.is_pvp);
@@ -771,9 +793,17 @@ export async function getTopCandidates({ limit = 10 } = {}) {
     const athFilter = config.screening.athFilterPct;
     if (athFilter != null) {
       const threshold = 100 + athFilter; // e.g. -20 → threshold = 80 (price must be <= 80% of ATH)
+      // failOpenOnAthDataUnavailable: true  → pool passes when price data is missing (dry-run default)
+      // failOpenOnAthDataUnavailable: false → pool rejected when price data missing (live default)
+      const failOpenAth = config.screening.failOpenOnAthDataUnavailable ?? isDryRun;
       const before = eligible.length;
       eligible.splice(0, eligible.length, ...eligible.filter((p) => {
-        if (p.price_vs_ath_pct == null) return true; // no data → don't filter
+        if (p.price_vs_ath_pct == null) {
+          if (failOpenAth) return true;
+          log("screening", `ATH filter: dropped ${p.name} — ATH data unavailable`);
+          pushFilteredReason(filteredOut, p, "ATH data unavailable");
+          return false;
+        }
         if (p.price_vs_ath_pct > threshold) {
           log("screening", `ATH filter: dropped ${p.name} — ${p.price_vs_ath_pct}% of ATH (limit: ${threshold}%)`);
           pushFilteredReason(filteredOut, p, `${p.price_vs_ath_pct}% of ATH > ${threshold}% limit`);
@@ -798,9 +828,9 @@ export async function getTopCandidates({ limit = 10 } = {}) {
     if (eligible.length < before) log("dev_blocklist", `Filtered ${before - eligible.length} pool(s) via OKX creator check`);
 
     // ── Hard risk filters (OKX enriched fields) ─────────────────────────────
-    const maxBundle     = Number(config.screening.maxBundlePct     ?? 30);
-    const maxSniper     = Number(config.screening.maxSniperPct     ?? 30);
-    const maxSuspicious = Number(config.screening.maxSuspiciousPct ?? 30);
+    const maxBundle     = requiredFinite("maxBundlePct",     config.screening.maxBundlePct,     30);
+    const maxSniper     = requiredFinite("maxSniperPct",     config.screening.maxSniperPct,     30);
+    const maxSuspicious = requiredFinite("maxSuspiciousPct", config.screening.maxSuspiciousPct, 30);
     const riskBefore    = eligible.length;
     eligible.splice(0, eligible.length, ...eligible.filter((p) => {
       if (p.is_rugpull) {
@@ -917,7 +947,7 @@ export async function getTopCandidates({ limit = 10 } = {}) {
     });
   }
 
-  const debugLimit = Number(config.screening.filteredExamplesLimit ?? 20);
+  const debugLimit = normalizeLimit(config.screening.filteredExamplesLimit, 20, 200);
   const filterSummary = filteredOut.reduce((acc, item) => {
     acc[item.reason] = (acc[item.reason] || 0) + 1;
     return acc;
@@ -942,13 +972,14 @@ export async function getTopCandidates({ limit = 10 } = {}) {
  * Fetches top 50 pools from discovery API and finds the matching address.
  * Returns the full unfiltered API object (all fields, not condensed).
  */
-export async function getPoolDetail({ pool_address, timeframe = getVolatilityTimeframe(config.screening.timeframe) }) {
-  const pool = await fetchPoolDiscoveryDetail({ poolAddress: pool_address, timeframe });
+export async function getPoolDetail({ pool_address, timeframe } = {}) {
+  if (!pool_address) throw new Error("getPoolDetail: pool_address is required");
+  const s = normalizeScreeningConfig(config.screening);
+  const tf = timeframe ?? getVolatilityTimeframe(s.timeframe);
+  if (!TIMEFRAME_MINUTES[tf]) throw new Error(`getPoolDetail: invalid timeframe=${tf}`);
 
-  if (!pool) {
-    throw new Error(`Pool ${pool_address} not found`);
-  }
-
+  const pool = await fetchPoolDiscoveryDetail({ poolAddress: pool_address, timeframe: tf, category: s.category });
+  if (!pool) throw new Error(`Pool ${pool_address} not found`);
   return pool;
 }
 
