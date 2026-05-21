@@ -176,7 +176,7 @@ async function fetchJson(url, { timeoutMs = 8000, retries = 2, headers } = {}) {
       // Don't retry if server said it's a client error (e.g. 400/401/403/404)
       if (err.status && err.status >= 400 && err.status < 500 && !RETRYABLE_STATUS.has(err.status)) break;
       if (attempt === retries) break;
-      await new Promise((r) => setTimeout(r, 500 * (attempt + 1)));
+      await new Promise((r) => setTimeout(r, 500 * (attempt + 1) + Math.random() * 300));
     }
   }
   throw lastError;
@@ -372,13 +372,11 @@ async function enrichDiscordSignalLaunchpads(rawPools) {
   if (missing.length === 0) return;
 
   const uniqueMints = [...new Set(missing.map(getPoolBaseMint).filter(Boolean))];
-  const results = await Promise.allSettled(
-    uniqueMints.map(async (mint) => {
-      const assets = await searchAssetsBySymbol(mint);
-      const asset = assets.find((item) => item?.id === mint) || assets[0] || null;
-      return { mint, asset };
-    })
-  );
+  const results = await mapWithConcurrency(uniqueMints, 5, async (mint) => {
+    const assets = await searchAssetsBySymbol(mint);
+    const asset = assets.find((item) => item?.id === mint) || assets[0] || null;
+    return { mint, asset };
+  });
 
   const byMint = new Map();
   for (const result of results) {
@@ -418,6 +416,18 @@ async function findRivalPool(mint) {
   return pools.find((pool) => pool?.token_x?.address === mint || pool?.token_y?.address === mint) || null;
 }
 
+// ── PVP symbol cache — TTL 2 min — avoids re-fetching same symbol across screening cycles ──
+const PVP_SYMBOL_CACHE_TTL_MS = 2 * 60 * 1000;
+const _pvpSymbolCache = new Map(); // symbol → { assets, ts }
+
+async function cachedSearchAssetsBySymbol(symbol) {
+  const entry = _pvpSymbolCache.get(symbol);
+  if (entry && Date.now() - entry.ts < PVP_SYMBOL_CACHE_TTL_MS) return entry.assets;
+  const assets = await searchAssetsBySymbol(symbol).catch(() => []);
+  _pvpSymbolCache.set(symbol, { assets, ts: Date.now() });
+  return assets;
+}
+
 async function enrichPvpRisk(pools, { limit = pools.length } = {}) {
   const shortlist = [...pools]
     .sort((a, b) => scoreCandidate(b) - scoreCandidate(a))
@@ -425,18 +435,20 @@ async function enrichPvpRisk(pools, { limit = pools.length } = {}) {
 
   if (shortlist.length === 0) return;
 
-  const symbolCache = new Map();
+  // Pre-warm symbol cache sequentially for unique symbols — avoids N concurrent requests
+  // for the same symbol when multiple pools share a ticker
+  const uniqueSymbols = [...new Set(shortlist.map((p) => normalizeSymbol(p.base?.symbol)).filter(Boolean))];
+  await mapWithConcurrency(uniqueSymbols, 3, async (symbol) => {
+    await cachedSearchAssetsBySymbol(symbol);
+  });
 
-  await Promise.all(shortlist.map(async (pool) => {
+  // Now process pools with cache warm — max 3 concurrent (PVP is API-heavy per pool)
+  await mapWithConcurrency(shortlist, 3, async (pool) => {
     const symbol = normalizeSymbol(pool.base?.symbol);
     const ownMint = pool.base?.mint;
     if (!symbol || !ownMint) return;
 
-    let assets = symbolCache.get(symbol);
-    if (!assets) {
-      assets = await searchAssetsBySymbol(symbol).catch(() => []);
-      symbolCache.set(symbol, assets);
-    }
+    const assets = await cachedSearchAssetsBySymbol(symbol);
 
     const rivalAssets = assets
       .filter((asset) => normalizeSymbol(asset?.symbol) === symbol && asset?.id && asset.id !== ownMint)
@@ -463,7 +475,7 @@ async function enrichPvpRisk(pools, { limit = pools.length } = {}) {
       log("screening", `PVP guard: ${pool.name} has active rival ${pool.pvp_rival_name} (${rival.id.slice(0, 8)})`);
       break;
     }
-  }));
+  });
 }
 
 
@@ -593,17 +605,15 @@ export async function discoverPools({
   if (Object.keys(blockedDevs).length > 0) {
     const missingDev = pools.filter((p) => !p.dev && p.base?.mint);
     if (missingDev.length > 0) {
-      const devResults = await Promise.allSettled(
-        missingDev.map((p) =>
-          fetchJson(`${DATAPI_JUP}/assets/search?query=${encodeURIComponent(p.base.mint)}`)
-            .then((d) => {
-              // Match by exact mint ID — d[0] could be a different asset with same query prefix
-              const arr = Array.isArray(d) ? d : [d];
-              const token = arr.find((x) => x?.id === p.base.mint) || null;
-              return { pool: p.pool, dev: token?.dev || null };
-            })
-            .catch(() => ({ pool: p.pool, dev: null }))
-        )
+      const devResults = await mapWithConcurrency(missingDev, 5, (p) =>
+        fetchJson(`${DATAPI_JUP}/assets/search?query=${encodeURIComponent(p.base.mint)}`)
+          .then((d) => {
+            // Match by exact mint ID — d[0] could be a different asset with same query prefix
+            const arr = Array.isArray(d) ? d : [d];
+            const token = arr.find((x) => x?.id === p.base.mint) || null;
+            return { pool: p.pool, dev: token?.dev || null };
+          })
+          .catch(() => ({ pool: p.pool, dev: null }))
       );
       const devMap = {};
       for (const r of devResults) {
@@ -929,31 +939,32 @@ export async function getTopCandidates({ limit = 10 } = {}) {
   }
 
   if (config.indicators.enabled && eligible.length > 0) {
-    const confirmations = await Promise.all(
-      eligible.map(async (pool) => {
-        try {
-          const confirmation = await confirmIndicatorPreset({
-            mint: pool.base?.mint,
-            side: "entry",
-          });
-          return { pool: pool.pool, confirmation };
-        } catch (error) {
-          // failOpenOnError: true  → let pool through when indicator service is down (permissive)
-          // failOpenOnError: false → reject pool when indicator service is down (safe default for live)
-          const failOpen = config.indicators?.failOpenOnError ?? false;
-          return {
-            pool: pool.pool,
-            confirmation: {
-              enabled: true,
-              confirmed: failOpen,
-              skipped: true,
-              reason: `Indicator confirmation unavailable: ${error.message}`,
-              intervals: [],
-            },
-          };
-        }
-      }),
-    );
+    // Limit indicator concurrency — TradingView/candle bridge can be slow; burst causes stale results
+    const confirmationResults = await mapWithConcurrency(eligible, 5, async (pool) => {
+      try {
+        const confirmation = await confirmIndicatorPreset({
+          mint: pool.base?.mint,
+          side: "entry",
+        });
+        return { pool: pool.pool, confirmation };
+      } catch (error) {
+        // failOpenOnError: true  → let pool through when indicator service is down (permissive)
+        // failOpenOnError: false → reject pool when indicator service is down (safe default for live)
+        const failOpen = config.indicators?.failOpenOnError ?? false;
+        return {
+          pool: pool.pool,
+          confirmation: {
+            enabled: true,
+            confirmed: failOpen,
+            skipped: true,
+            reason: `Indicator confirmation unavailable: ${error.message}`,
+            intervals: [],
+          },
+        };
+      }
+    });
+    // mapWithConcurrency wraps in settled format — mapper has try/catch so all are fulfilled
+    const confirmations = confirmationResults.map((r) => r.value);
     const confirmationByPool = new Map(confirmations.map((entry) => [entry.pool, entry.confirmation]));
     const before = eligible.length;
     const confirmedEligible = eligible.filter((pool) => {
@@ -1116,10 +1127,13 @@ function fix(n, decimals) {
   return Number.isFinite(value) ? Number(value.toFixed(decimals)) : null;
 }
 
-// Cap filteredOut memory growth — prevents RAM bloat on large page_sizes or long-running loops
+// Ring-buffer cap — keeps the most recent MAX_FILTERED_OUT entries.
+// Older entries are evicted so debug output always reflects the latest rejection wave,
+// not stale early-cycle drops that may no longer be relevant.
 const MAX_FILTERED_OUT = 500;
 function pushFilteredReason(list, pool, reason) {
-  if (!list || !pool || list.length >= MAX_FILTERED_OUT) return;
+  if (!list || !pool) return;
+  if (list.length >= MAX_FILTERED_OUT) list.shift(); // evict oldest, keep ring fresh
   list.push({
     name: pool.name || `${pool.base?.symbol || "?"}-${pool.quote?.symbol || "?"}`,
     reason,
