@@ -401,7 +401,11 @@ async function getPool(poolAddress) {
   return poolCache.get(key);
 }
 
-setInterval(() => poolCache.clear(), 5 * 60 * 1000);
+// P1: Reduce poolCache TTL to 60s — 5 minutes was too long for close/claim/activeBin lookups.
+// Deploy already force-clears the cache per-pool before use, but close and activeBin queries
+// were still reading SDK objects up to 5 minutes stale.
+// poolMetadataCache (name/symbols only) is less time-sensitive; keep at 15 minutes.
+setInterval(() => poolCache.clear(), 60 * 1000);
 setInterval(() => poolMetadataCache.clear(), 15 * 60 * 1000);
 
 async function getPoolMetadata(poolAddress) {
