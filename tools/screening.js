@@ -27,17 +27,48 @@ const PVP_MIN_ACTIVE_TVL = 5_000;
 const PVP_MIN_HOLDERS = 500;
 const PVP_MIN_GLOBAL_FEES_SOL = 30;
 
-// Cached Darwin scorer weights — loaded once per process, refreshed on recalc
+// ── Concurrency limiter — prevents API burst (429 / timeout storm) ───────────
+// Returns an array in the same settled format as Promise.allSettled.
+async function mapWithConcurrency(items, concurrency, mapper) {
+  const results = new Array(items.length);
+  let index = 0;
+  async function worker() {
+    while (index < items.length) {
+      const i = index++;
+      try {
+        results[i] = { status: "fulfilled", value: await mapper(items[i], i) };
+      } catch (err) {
+        results[i] = { status: "rejected", reason: err };
+      }
+    }
+  }
+  await Promise.all(
+    Array.from({ length: Math.min(concurrency, items.length) }, worker)
+  );
+  return results;
+}
+
+// ── Cached Darwin scorer weights with TTL (5 min) ────────────────────────────
+const DARWIN_CACHE_TTL_MS = 5 * 60 * 1000;
 let _darwinScorerWeightsCache = null;
+let _darwinCacheTimestamp = 0;
 async function loadDarwinScorerWeights() {
-  if (_darwinScorerWeightsCache) return _darwinScorerWeightsCache;
+  if (_darwinScorerWeightsCache && Date.now() - _darwinCacheTimestamp < DARWIN_CACHE_TTL_MS) {
+    return _darwinScorerWeightsCache;
+  }
   try {
     const { getDarwinScorerWeights } = await import("../signal-weights.js");
     _darwinScorerWeightsCache = getDarwinScorerWeights();
   } catch {
     _darwinScorerWeightsCache = {};
   }
+  _darwinCacheTimestamp = Date.now();
   return _darwinScorerWeightsCache;
+}
+/** Force-refresh Darwin weights cache (call after recalculation completes). */
+export function invalidateDarwinCache() {
+  _darwinScorerWeightsCache = null;
+  _darwinCacheTimestamp = 0;
 }
 
 function normalizeSymbol(symbol) {
@@ -45,21 +76,24 @@ function normalizeSymbol(symbol) {
 }
 
 function scoreCandidate(pool) {
-  const feeTvl    = Number(pool.fee_active_tvl_ratio || 0);
-  const organic   = Number(pool.organic_score || pool.base?.organic || 0);
-  const volume    = Math.log10(Number(pool.volume_window || 0) + 1);
-  const holders   = Math.log10(Number(pool.holders || 0) + 1);
-  const activePct = Number(pool.active_pct || 0);
+  const feeTvl     = Number(pool.fee_active_tvl_ratio || 0);
+  const organic    = Number(pool.organic_score || pool.base?.organic || 0);
+  const volume     = Math.log10(Number(pool.volume_window || 0) + 1);
+  const holders    = Math.log10(Number(pool.holders || 0) + 1);
+  const activePct  = Number(pool.active_pct || 0);
   const volatility = Number(pool.volatility || 0);
+  const tvl        = Number(pool.tvl || pool.active_tvl || 0);
 
   let score = 0;
-  score += feeTvl * 1000;
+  // Cap feeTvl at 0.3 (300pts max) — prevents fee spikes on micro-TVL pools dominating ranking
+  score += Math.min(feeTvl, 0.3) * 1000;
   score += organic * 3;
   score += volume * 20;
   score += holders * 10;
   score += activePct * 0.5;
   if (!Number.isFinite(volatility) || volatility <= 0) score -= 100;
   if (volatility > 20) score -= 50;
+  if (tvl < 5_000) score -= 30;  // penalize micro-TVL pools for stability
   return score;
 }
 
@@ -296,11 +330,9 @@ async function applyVolatilityTimeframe(rawPools, sourceTimeframe) {
   }
 
   const uniquePoolAddresses = [...new Set(rawPools.map((pool) => pool?.pool_address).filter(Boolean))];
-  const volatilityResults = await Promise.allSettled(
-    uniquePoolAddresses.map((poolAddress) =>
-      fetchPoolDiscoveryDetail({ poolAddress, timeframe: volatilityTimeframe })
-        .then((pool) => ({ poolAddress, volatility: numeric(pool?.volatility) }))
-    )
+  const volatilityResults = await mapWithConcurrency(uniquePoolAddresses, 5, (poolAddress) =>
+    fetchPoolDiscoveryDetail({ poolAddress, timeframe: volatilityTimeframe })
+      .then((pool) => ({ poolAddress, volatility: numeric(pool?.volatility) }))
   );
 
   const volatilityByPool = new Map();
@@ -697,30 +729,28 @@ export async function getTopCandidates({ limit = 10 } = {}) {
   // Enrich with OKX data — advanced info (risk/bundle/sniper) + ATH price (no API key required)
   if (eligible.length > 0) {
     const { getAdvancedInfo, getPriceInfo, getClusterList, getRiskFlags } = await import("./okx.js");
-    const okxResults = await Promise.allSettled(
-      eligible.map(async (p) => {
-        if (!p.base?.mint) return { adv: null, price: null, clusters: [], risk: null };
-        const [adv, price, clusters, risk] = await Promise.allSettled([
-          getAdvancedInfo(p.base.mint),
-          getPriceInfo(p.base.mint),
-          getClusterList(p.base.mint),
-          getRiskFlags(p.base.mint),
-        ]);
+    const okxResults = await mapWithConcurrency(eligible, 5, async (p) => {
+      if (!p.base?.mint) return { adv: null, price: null, clusters: [], risk: null };
+      const [adv, price, clusters, risk] = await Promise.allSettled([
+        getAdvancedInfo(p.base.mint),
+        getPriceInfo(p.base.mint),
+        getClusterList(p.base.mint),
+        getRiskFlags(p.base.mint),
+      ]);
 
-        const mintShort = p.base.mint.slice(0, 8);
-        if (adv.status !== "fulfilled")      log("okx", `advanced-info unavailable for ${p.name} (${mintShort})`);
-        if (price.status !== "fulfilled")    log("okx", `price-info unavailable for ${p.name} (${mintShort})`);
-        if (clusters.status !== "fulfilled") log("okx", `cluster-list unavailable for ${p.name} (${mintShort})`);
-        if (risk.status !== "fulfilled")     log("okx", `risk-check unavailable for ${p.name} (${mintShort})`);
+      const mintShort = p.base.mint.slice(0, 8);
+      if (adv.status !== "fulfilled")      log("okx", `advanced-info unavailable for ${p.name} (${mintShort})`);
+      if (price.status !== "fulfilled")    log("okx", `price-info unavailable for ${p.name} (${mintShort})`);
+      if (clusters.status !== "fulfilled") log("okx", `cluster-list unavailable for ${p.name} (${mintShort})`);
+      if (risk.status !== "fulfilled")     log("okx", `risk-check unavailable for ${p.name} (${mintShort})`);
 
-        return {
-          adv: adv.status === "fulfilled" ? adv.value : null,
-          price: price.status === "fulfilled" ? price.value : null,
-          clusters: clusters.status === "fulfilled" ? clusters.value : [],
-          risk: risk.status === "fulfilled" ? risk.value : null,
-        };
-      })
-    );
+      return {
+        adv: adv.status === "fulfilled" ? adv.value : null,
+        price: price.status === "fulfilled" ? price.value : null,
+        clusters: clusters.status === "fulfilled" ? clusters.value : [],
+        risk: risk.status === "fulfilled" ? risk.value : null,
+      };
+    });
     for (let i = 0; i < eligible.length; i++) {
       const r = okxResults[i];
       if (r.status !== "fulfilled") continue;
@@ -792,7 +822,13 @@ export async function getTopCandidates({ limit = 10 } = {}) {
     // ATH filter — drop pools where price is too close to ATH
     const athFilter = config.screening.athFilterPct;
     if (athFilter != null) {
-      const threshold = 100 + athFilter; // e.g. -20 → threshold = 80 (price must be <= 80% of ATH)
+      // Clamp to [-100, 100] — prevents misconfig like athFilterPct=200 (passes everything)
+      // or athFilterPct=-200 (fails everything) from silently breaking the filter
+      const clampedAth = Math.min(Math.max(Number(athFilter), -100), 100);
+      if (!Number.isFinite(clampedAth)) {
+        log("screening", `ATH filter: skipped — athFilterPct=${athFilter} is not a valid number`);
+      } else {
+      const threshold = 100 + clampedAth; // e.g. -20 → threshold = 80 (price must be <= 80% of ATH)
       // failOpenOnAthDataUnavailable: true  → pool passes when price data is missing (dry-run default)
       // failOpenOnAthDataUnavailable: false → pool rejected when price data missing (live default)
       const failOpenAth = config.screening.failOpenOnAthDataUnavailable ?? isDryRun;
@@ -812,6 +848,7 @@ export async function getTopCandidates({ limit = 10 } = {}) {
         return true;
       }));
       if (eligible.length < before) log("screening", `ATH filter removed ${before - eligible.length} pool(s)`);
+      } // end else (valid clampedAth)
     }
 
     // Drop any pools whose creator is on the dev blocklist (caught via advanced-info)
@@ -831,6 +868,9 @@ export async function getTopCandidates({ limit = 10 } = {}) {
     const maxBundle     = requiredFinite("maxBundlePct",     config.screening.maxBundlePct,     30);
     const maxSniper     = requiredFinite("maxSniperPct",     config.screening.maxSniperPct,     30);
     const maxSuspicious = requiredFinite("maxSuspiciousPct", config.screening.maxSuspiciousPct, 30);
+    // failClosedOnMissingRiskMetrics: true  → reject pool if bundle/sniper/suspicious_pct is null (live default)
+    // failClosedOnMissingRiskMetrics: false → allow pool when metrics are absent (dry-run default)
+    const failClosedMetrics = config.screening.failClosedOnMissingRiskMetrics ?? !isDryRun;
     const riskBefore    = eligible.length;
     eligible.splice(0, eligible.length, ...eligible.filter((p) => {
       if (p.is_rugpull) {
@@ -843,17 +883,35 @@ export async function getTopCandidates({ limit = 10 } = {}) {
         pushFilteredReason(filteredOut, p, "risk_level high");
         return false;
       }
-      if (Number.isFinite(Number(p.bundle_pct)) && Number(p.bundle_pct) > maxBundle) {
+      if (p.bundle_pct == null) {
+        if (failClosedMetrics) {
+          log("screening", `Risk filter: dropped ${p.name} — bundle_pct missing (fail-closed)`);
+          pushFilteredReason(filteredOut, p, "bundle_pct missing");
+          return false;
+        }
+      } else if (Number.isFinite(Number(p.bundle_pct)) && Number(p.bundle_pct) > maxBundle) {
         log("screening", `Risk filter: dropped ${p.name} — bundle_pct ${p.bundle_pct} > ${maxBundle}`);
         pushFilteredReason(filteredOut, p, `bundle_pct ${p.bundle_pct} > limit ${maxBundle}`);
         return false;
       }
-      if (Number.isFinite(Number(p.sniper_pct)) && Number(p.sniper_pct) > maxSniper) {
+      if (p.sniper_pct == null) {
+        if (failClosedMetrics) {
+          log("screening", `Risk filter: dropped ${p.name} — sniper_pct missing (fail-closed)`);
+          pushFilteredReason(filteredOut, p, "sniper_pct missing");
+          return false;
+        }
+      } else if (Number.isFinite(Number(p.sniper_pct)) && Number(p.sniper_pct) > maxSniper) {
         log("screening", `Risk filter: dropped ${p.name} — sniper_pct ${p.sniper_pct} > ${maxSniper}`);
         pushFilteredReason(filteredOut, p, `sniper_pct ${p.sniper_pct} > limit ${maxSniper}`);
         return false;
       }
-      if (Number.isFinite(Number(p.suspicious_pct)) && Number(p.suspicious_pct) > maxSuspicious) {
+      if (p.suspicious_pct == null) {
+        if (failClosedMetrics) {
+          log("screening", `Risk filter: dropped ${p.name} — suspicious_pct missing (fail-closed)`);
+          pushFilteredReason(filteredOut, p, "suspicious_pct missing");
+          return false;
+        }
+      } else if (Number.isFinite(Number(p.suspicious_pct)) && Number(p.suspicious_pct) > maxSuspicious) {
         log("screening", `Risk filter: dropped ${p.name} — suspicious_pct ${p.suspicious_pct} > ${maxSuspicious}`);
         pushFilteredReason(filteredOut, p, `suspicious_pct ${p.suspicious_pct} > limit ${maxSuspicious}`);
         return false;
@@ -1058,8 +1116,10 @@ function fix(n, decimals) {
   return Number.isFinite(value) ? Number(value.toFixed(decimals)) : null;
 }
 
+// Cap filteredOut memory growth — prevents RAM bloat on large page_sizes or long-running loops
+const MAX_FILTERED_OUT = 500;
 function pushFilteredReason(list, pool, reason) {
-  if (!list || !pool) return;
+  if (!list || !pool || list.length >= MAX_FILTERED_OUT) return;
   list.push({
     name: pool.name || `${pool.base?.symbol || "?"}-${pool.quote?.symbol || "?"}`,
     reason,
