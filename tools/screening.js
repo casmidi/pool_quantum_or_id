@@ -528,8 +528,8 @@ async function cachedSearchAssetsBySymbol(symbol) {
 // Singleton guard (globalThis flag) prevents duplicate timers if the module is
 // hot-reloaded, imported in a test harness, or re-evaluated in any context.
 // .unref() ensures the timer never prevents the process from exiting cleanly.
-if (!globalThis.__screeningCacheSweepStarted) {
-  globalThis.__screeningCacheSweepStarted = true;
+if (!globalThis.__meridian_screeningCacheSweepStarted) {
+  globalThis.__meridian_screeningCacheSweepStarted = true;
   const CACHE_SWEEP_INTERVAL_MS = 5 * 60 * 1000; // every 5 minutes
   setInterval(() => {
     const now = Date.now();
