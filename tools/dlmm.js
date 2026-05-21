@@ -425,12 +425,15 @@ async function getPoolMetadata(poolAddress) {
       name: pair,
       token_x_symbol: tokenX,
       token_y_symbol: tokenY,
+      metadata_quality: "complete",
     };
     poolMetadataCache.set(key, meta);
     return meta;
   } catch (error) {
     log("pool_meta_warn", `Pool metadata lookup failed for ${key.slice(0, 8)}: ${error.message}`);
-    const fallback = { address: key, name: null, token_x_symbol: null, token_y_symbol: null };
+    // P3: metadata_quality flag — callers can detect silent API failure rather than
+    // assuming null name/symbols mean the pool has no metadata.
+    const fallback = { address: key, name: null, token_x_symbol: null, token_y_symbol: null, metadata_quality: "fallback" };
     poolMetadataCache.set(key, fallback);
     return fallback;
   }
@@ -608,6 +611,17 @@ export async function deployPosition({
       message: "DRY RUN — no transaction sent",
     };
   }
+
+  // P2: Deploy pending lock — prevents duplicate deploy to same pool in concurrent calls.
+  // Runs after DRY_RUN so dry-run simulations are never blocked.
+  if (_deployPending.has(pool_address)) {
+    return {
+      success: false,
+      error: "Deploy already in progress for this pool — wait for current deploy to complete.",
+    };
+  }
+  _deployPending.add(pool_address);
+  try {
 
   const isWideRange = totalBins > 69;
 
@@ -913,13 +927,24 @@ export async function deployPosition({
     log("deploy_error", error.message);
     return { success: false, error: error.message };
   }
+
+  } finally {
+    _deployPending.delete(pool_address);
+  }
 }
 
-const POSITIONS_CACHE_TTL = 5 * 60_000; // 5 minutes
+// P1: 1-minute cache — 5 minutes was too stale for volatile DLMM pools.
+// Active bin can shift significantly in 5 min; manager could think it's in-range when OOR.
+const POSITIONS_CACHE_TTL = 60_000; // 1 minute
 
 let _positionsCache = null;
 let _positionsCacheAt = 0;
 let _positionsInflight = null; // deduplicates concurrent calls
+
+// P2: In-memory pending operation guards — prevent race-condition double-deploy/double-close
+// within the same process. Not persistent across restarts, but covers the common live case.
+const _deployPending = new Set(); // pool_address currently being deployed
+const _closePending  = new Set(); // position_address currently being closed
 const LPAGENT_API = "https://api.lpagent.io/open-api/v1";
 
 async function fetchLpAgentOpenPositions(walletAddress) {
@@ -1451,6 +1476,16 @@ export async function closePosition({ position_address, reason }) {
 
   const tracked = getTrackedPosition(position_address);
 
+  // P1/P2: Close pending lock — prevents duplicate close attempt to same position.
+  // Returns early if another close is already in flight (e.g. management cycle overlap).
+  if (_closePending.has(position_address)) {
+    return {
+      success: false,
+      error: "Close already in progress for this position — wait for current close to complete.",
+    };
+  }
+  _closePending.add(position_address);
+
   try {
     log("close", `Closing position: ${position_address}`);
     const wallet = getWallet();
@@ -1530,16 +1565,24 @@ export async function closePosition({ position_address, reason }) {
         throw new Error("LPAgent close order returned no transactions. Check the position, selected output, and relay order response.");
       }
 
+      // P1: Dynamic maxSolLoss — 3% of deployed position size, capped at 0.05 SOL.
+      // Fixed 0.05 was too tight for large positions and too loose for small ones.
+      const _deployedSol = Number(tracked?.amount_sol ?? config.management?.deployAmountSol ?? 0.5);
+      const _dynSolLoss  = _deployedSol * 0.03;
+      const closeMaxSolLoss = Number.isFinite(_dynSolLoss) && _dynSolLoss > 0
+        ? Math.min(_dynSolLoss, 0.05)
+        : 0.05;
+
       const closeSigned = await signAndSimulateRelayTransactions(closeUnsigned, wallet, {
         label: "zap-out close",
         allowedDebitMints: relayAllowedDebitMints,
-        maxSolLoss: 0.05,
+        maxSolLoss: closeMaxSolLoss,
         requiredStaticAccounts: [wallet.publicKey.toString(), position_address],
       });
       const swapSigned = await signAndSimulateRelayTransactions(swapUnsigned, wallet, {
         label: "zap-out swap",
         allowedDebitMints: relayAllowedDebitMints,
-        maxSolLoss: 0.05,
+        maxSolLoss: closeMaxSolLoss,
         requiredStaticAccounts: [wallet.publicKey.toString()],
       });
 
@@ -2000,6 +2043,8 @@ export async function closePosition({ position_address, reason }) {
   } catch (error) {
     log("close_error", error.message);
     return { success: false, error: error.message };
+  } finally {
+    _closePending.delete(position_address);
   }
 }
 
