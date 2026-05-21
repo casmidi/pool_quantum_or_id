@@ -522,6 +522,28 @@ async function cachedSearchAssetsBySymbol(symbol) {
   return assets;
 }
 
+// ── Periodic background cache sweep ──────────────────────────────────────────
+// Insert-triggered lazy sweep only runs during active screening.  This timer
+// catches expired entries in low-traffic windows (e.g. overnight, idle cycles).
+// .unref() ensures the timer never prevents the process from exiting cleanly.
+{
+  const CACHE_SWEEP_INTERVAL_MS = 5 * 60 * 1000; // every 5 minutes
+  setInterval(() => {
+    const now = Date.now();
+    let okxEvicted = 0;
+    for (const [k, v] of _okxCache) {
+      if (now - v.ts >= OKX_CACHE_TTL_MS) { _okxCache.delete(k); okxEvicted++; }
+    }
+    let pvpEvicted = 0;
+    for (const [k, v] of _pvpSymbolCache) {
+      if (now - v.ts >= PVP_SYMBOL_CACHE_TTL_MS) { _pvpSymbolCache.delete(k); pvpEvicted++; }
+    }
+    if (okxEvicted + pvpEvicted > 0) {
+      log("screening", `Periodic cache sweep: evicted ${okxEvicted} OKX + ${pvpEvicted} PVP expired entries`);
+    }
+  }, CACHE_SWEEP_INTERVAL_MS).unref();
+}
+
 async function enrichPvpRisk(pools, { limit = pools.length } = {}) {
   const shortlist = [...pools]
     .sort((a, b) => scoreCandidate(b) - scoreCandidate(a))
