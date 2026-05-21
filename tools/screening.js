@@ -64,16 +64,24 @@ function scoreCandidate(pool) {
 }
 
 // ── Config validator — pastikan nilai numerik tidak undefined/null sebelum query API ──
-function normalizeScreeningConfig(raw) {
+function normalizeScreeningConfig(raw = {}) {
+  if (!raw || typeof raw !== "object") {
+    throw new Error("Invalid config: screening config is missing or not an object");
+  }
   function req(name, value) {
     const n = Number(value);
     if (!Number.isFinite(n)) throw new Error(`Invalid screening config: ${name}=${value}`);
     return n;
   }
+  const timeframe = raw.timeframe || MIN_VOLATILITY_TIMEFRAME;
+  if (!TIMEFRAME_MINUTES[timeframe]) {
+    throw new Error(`Invalid screening config: timeframe=${timeframe} (valid: ${Object.keys(TIMEFRAME_MINUTES).join(", ")})`);
+  }
   return {
     ...raw,
+    timeframe,
     minMcap:              req("minMcap",              raw.minMcap),
-    maxMcap:              raw.maxMcap  == null ? Infinity : req("maxMcap",  raw.maxMcap),
+    maxMcap:              raw.maxMcap  == null ? null : req("maxMcap",  raw.maxMcap),
     minHolders:           req("minHolders",           raw.minHolders),
     minVolume:            req("minVolume",             raw.minVolume),
     minTvl:               req("minTvl",               raw.minTvl),
@@ -172,7 +180,7 @@ function getRawPoolScreeningRejectReason(pool, s) {
   if (pool?.pool_type && pool.pool_type !== "dlmm") return `pool_type ${pool.pool_type} is not dlmm`;
 
   if (mcap == null || mcap < s.minMcap) return `mcap ${mcap ?? "unknown"} below minMcap ${s.minMcap}`;
-  if (mcap > s.maxMcap) return `mcap ${mcap} above maxMcap ${s.maxMcap}`;
+  if (s.maxMcap != null && mcap > s.maxMcap) return `mcap ${mcap} above maxMcap ${s.maxMcap}`;
   if (holders == null || holders < s.minHolders) return `holders ${holders ?? "unknown"} below minHolders ${s.minHolders}`;
   if (volume == null || volume < s.minVolume) return `volume ${volume ?? "unknown"} below minVolume ${s.minVolume}`;
   if (tvl == null || tvl < s.minTvl) return `TVL ${tvl ?? "unknown"} below minTvl ${s.minTvl}`;
@@ -383,7 +391,7 @@ async function enrichPvpRisk(pools) {
       pool.pvp_symbol = pool.base?.symbol || symbol;
       pool.pvp_rival_name = rival?.name || pool.pvp_symbol;
       pool.pvp_rival_mint = rival.id;
-      pool.pvp_rival_pool = rivalPool.address;
+      pool.pvp_rival_pool = rivalPool.pool_address || rivalPool.address || null;
       pool.pvp_rival_tvl = round(Number(rivalPool.tvl || 0));
       pool.pvp_rival_holders = rivalHolders;
       pool.pvp_rival_fees = Number(rivalFees.toFixed(2));
@@ -410,7 +418,7 @@ export async function discoverPools({
     "base_token_has_high_single_ownership=false",
     "pool_type=dlmm",
     `base_token_market_cap>=${s.minMcap}`,
-    `base_token_market_cap<=${s.maxMcap}`,
+    s.maxMcap != null ? `base_token_market_cap<=${s.maxMcap}` : null,
     `base_token_holders>=${s.minHolders}`,
     `volume>=${s.minVolume}`,
     `tvl>=${s.minTvl}`,
@@ -481,6 +489,7 @@ export async function discoverPools({
   rawPools = await applyVolatilityTimeframe(rawPools, s.timeframe);
   await enrichDiscordSignalLaunchpads(rawPools);
 
+  const rawCount = rawPools.length;
   const filteredExamples = [];
   const thresholdedRawPools = rawPools.filter((pool) => {
     const reason = getRawPoolScreeningRejectReason(pool, s);
@@ -489,6 +498,7 @@ export async function discoverPools({
     if (pool.discord_signal) log("screening", `Discord signal filtered: ${pool.name || pool.pool_address} — ${reason}`);
     return false;
   });
+  const thresholdPassed = thresholdedRawPools.length;
 
   const condensed = thresholdedRawPools.map(condensePool);
 
@@ -496,17 +506,20 @@ export async function discoverPools({
   let pools = condensed.filter((p) => {
     if (isBlacklisted(p.base?.mint)) {
       log("blacklist", `Filtered blacklisted token ${p.base?.symbol} (${p.base?.mint?.slice(0, 8)}) in pool ${p.name}`);
+      filteredExamples.push({ name: p.name, reason: "blacklisted token" });
       return false;
     }
     if (p.dev && isDevBlocked(p.dev)) {
       log("dev_blocklist", `Filtered blocked deployer ${p.dev?.slice(0, 8)} token ${p.base?.symbol} in pool ${p.name}`);
+      filteredExamples.push({ name: p.name, reason: "blocked deployer" });
       return false;
     }
     return true;
   });
+  const afterBlacklist = pools.length;
 
-  const filtered = condensed.length - pools.length;
-  if (filtered > 0) log("blacklist", `Filtered ${filtered} pool(s) with blacklisted tokens/devs`);
+  const blFiltered = condensed.length - pools.length;
+  if (blFiltered > 0) log("blacklist", `Filtered ${blFiltered} pool(s) with blacklisted tokens/devs`);
 
   // If pool discovery didn't supply dev field, batch-fetch from Jupiter for any pools
   // where dev is null — but only if the dev blocklist is non-empty (avoid useless calls)
@@ -516,11 +529,12 @@ export async function discoverPools({
     if (missingDev.length > 0) {
       const devResults = await Promise.allSettled(
         missingDev.map((p) =>
-          fetch(`${DATAPI_JUP}/assets/search?query=${p.base.mint}`)
-            .then((r) => r.ok ? r.json() : null)
+          fetchJson(`${DATAPI_JUP}/assets/search?query=${encodeURIComponent(p.base.mint)}`)
             .then((d) => {
-              const t = Array.isArray(d) ? d[0] : d;
-              return { pool: p.pool, dev: t?.dev || null };
+              // Match by exact mint ID — d[0] could be a different asset with same query prefix
+              const arr = Array.isArray(d) ? d : [d];
+              const token = arr.find((x) => x?.id === p.base.mint) || null;
+              return { pool: p.pool, dev: token?.dev || null };
             })
             .catch(() => ({ pool: p.pool, dev: null }))
         )
@@ -542,7 +556,10 @@ export async function discoverPools({
   }
 
   return {
-    total: data.total,
+    api_total:        data.total,    // what the API says it has
+    raw_count:        rawCount,      // how many came back in this page
+    threshold_passed: thresholdPassed,
+    after_blacklist:  afterBlacklist,
     pools,
     filtered_examples: filteredExamples,
   };
@@ -617,7 +634,9 @@ export async function getTopCandidates({ limit = 10 } = {}) {
       return true;
     })
     .sort((a, b) => scoreCandidate(b) - scoreCandidate(a))
-    .slice(0, limit);
+    // Take a wide shortlist so OKX/indicator filters can trim without running out of candidates.
+    // Final trim to `limit` happens after pool_score ranking below.
+    .slice(0, Math.max(limit * 3, 30));
 
   if (config.screening.avoidPvpSymbols && eligible.length > 0) {
     await enrichPvpRisk(eligible);
@@ -827,6 +846,8 @@ export async function getTopCandidates({ limit = 10 } = {}) {
       pool.score_breakdown    = scored.breakdown;
     }
     eligible.sort((a, b) => (b.pool_score ?? 0) - (a.pool_score ?? 0));
+    // Final trim to requested limit — done here, AFTER all risk/indicator filters
+    eligible.splice(limit);
     log("screening", `Pool-scorer ranked ${eligible.length} candidate(s) — top score: ${eligible[0]?.pool_score ?? 0}`);
     eligible.forEach((pool, i) => {
       const feeAtvl = ((Number(pool.fee_active_tvl_ratio)||0)*100).toFixed(3)+'%';
@@ -847,9 +868,15 @@ export async function getTopCandidates({ limit = 10 } = {}) {
 
   return {
     candidates: eligible,
-    total_screened: pools.length,
+    // Full funnel — helps agent and logs understand where pools dropped out
+    api_total:         discovery.api_total,
+    raw_count:         discovery.raw_count,
+    threshold_passed:  discovery.threshold_passed,
+    after_blacklist:   discovery.after_blacklist,
+    total_screened:    pools.length,
+    final_count:       eligible.length,
     filtered_examples: filteredOut.slice(0, debugLimit),
-    filter_summary: filterSummary,
+    filter_summary:    filterSummary,
   };
 }
 
@@ -858,7 +885,7 @@ export async function getTopCandidates({ limit = 10 } = {}) {
  * Fetches top 50 pools from discovery API and finds the matching address.
  * Returns the full unfiltered API object (all fields, not condensed).
  */
-export async function getPoolDetail({ pool_address, timeframe = "5m" }) {
+export async function getPoolDetail({ pool_address, timeframe = getVolatilityTimeframe(config.screening.timeframe) }) {
   const pool = await fetchPoolDiscoveryDetail({ poolAddress: pool_address, timeframe });
 
   if (!pool) {
