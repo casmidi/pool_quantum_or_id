@@ -525,8 +525,11 @@ async function cachedSearchAssetsBySymbol(symbol) {
 // ── Periodic background cache sweep ──────────────────────────────────────────
 // Insert-triggered lazy sweep only runs during active screening.  This timer
 // catches expired entries in low-traffic windows (e.g. overnight, idle cycles).
+// Singleton guard (globalThis flag) prevents duplicate timers if the module is
+// hot-reloaded, imported in a test harness, or re-evaluated in any context.
 // .unref() ensures the timer never prevents the process from exiting cleanly.
-{
+if (!globalThis.__screeningCacheSweepStarted) {
+  globalThis.__screeningCacheSweepStarted = true;
   const CACHE_SWEEP_INTERVAL_MS = 5 * 60 * 1000; // every 5 minutes
   setInterval(() => {
     const now = Date.now();
