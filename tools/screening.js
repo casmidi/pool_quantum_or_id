@@ -536,21 +536,28 @@ async function cachedSearchAssetsBySymbol(symbol) {
 // graceful-shutdown callers (e.g. SIGTERM handler in index.js).
 const _SWEEP_SINGLETON = Symbol.for("meridian.screening.cacheSweep");
 let _cacheSweepTimer = null;
+let _sweeping = false; // backpressure flag — skip interval tick if previous sweep is still running
 if (!globalThis[_SWEEP_SINGLETON]) {
   globalThis[_SWEEP_SINGLETON] = true;
   const CACHE_SWEEP_INTERVAL_MS = 5 * 60 * 1000; // every 5 minutes
   _cacheSweepTimer = setInterval(() => {
-    const now = Date.now();
-    let okxEvicted = 0;
-    for (const [k, v] of _okxCache) {
-      if (now - v.ts >= OKX_CACHE_TTL_MS) { _okxCache.delete(k); okxEvicted++; }
-    }
-    let pvpEvicted = 0;
-    for (const [k, v] of _pvpSymbolCache) {
-      if (now - v.ts >= PVP_SYMBOL_CACHE_TTL_MS) { _pvpSymbolCache.delete(k); pvpEvicted++; }
-    }
-    if (okxEvicted + pvpEvicted > 0) {
-      log("screening", `Periodic cache sweep: evicted ${okxEvicted} OKX + ${pvpEvicted} PVP expired entries`);
+    if (_sweeping) return; // previous sweep not done — skip this tick
+    _sweeping = true;
+    try {
+      const now = Date.now();
+      let okxEvicted = 0;
+      for (const [k, v] of _okxCache) {
+        if (now - v.ts >= OKX_CACHE_TTL_MS) { _okxCache.delete(k); okxEvicted++; }
+      }
+      let pvpEvicted = 0;
+      for (const [k, v] of _pvpSymbolCache) {
+        if (now - v.ts >= PVP_SYMBOL_CACHE_TTL_MS) { _pvpSymbolCache.delete(k); pvpEvicted++; }
+      }
+      if (okxEvicted + pvpEvicted > 0) {
+        log("screening", `Periodic cache sweep: evicted ${okxEvicted} OKX + ${pvpEvicted} PVP expired entries`);
+      }
+    } finally {
+      _sweeping = false;
     }
   }, CACHE_SWEEP_INTERVAL_MS).unref();
 }
