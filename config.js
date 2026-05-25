@@ -19,6 +19,16 @@ function numericConfig(value) {
   return Number.isFinite(n) ? n : null;
 }
 
+function booleanConfig(value, fallback = false) {
+  if (value === true || value === false) return value;
+  if (typeof value === "string") {
+    const v = value.trim().toLowerCase();
+    if (["true", "1", "yes", "on"].includes(v)) return true;
+    if (["false", "0", "no", "off"].includes(v)) return false;
+  }
+  return fallback;
+}
+
 const legacyBinsBelow = numericConfig(u.binsBelow);
 const configuredMinBinsBelow = numericConfig(u.minBinsBelow) ?? MIN_SAFE_BINS_BELOW;
 const configuredMaxBinsBelow = numericConfig(u.maxBinsBelow)
@@ -58,13 +68,46 @@ export const config = {
   // ─── Mode ────────────────────────────────
   // process.env.DRY_RUN sudah disync dari u.dryRun di atas, jadi cukup baca env var.
   // Fallback false (live mode) jika tidak ada konfigurasi sama sekali.
-  dryRun: u.dryRun !== undefined ? Boolean(u.dryRun) : (process.env.DRY_RUN === "true"),
+  dryRun: u.dryRun !== undefined ? booleanConfig(u.dryRun, true) : (process.env.DRY_RUN === "true"),
   dryRunWallet: numericConfig(u.dry_run_wallet ?? u.dryRunWallet ?? process.env.DRY_RUN_WALLET),
 
   // ─── Risk Limits ─────────────────────────
   risk: {
-    maxPositions:    u.maxPositions    ?? 3,
-    maxDeployAmount: u.maxDeployAmount ?? 50,
+    maxPositions:         u.maxPositions         ?? 3,
+    maxDeployAmount:      u.maxDeployAmount       ?? 50,
+    // Portfolio-level breakers — pause deploy when trading is going badly.
+    // maxConsecutiveLosses: pause after N consecutive losing closes (null = disabled).
+    // maxDailyLossUsd: pause if total closed PnL in the last 24h falls below -X USD (null = disabled).
+    maxConsecutiveLosses: u.maxConsecutiveLosses ?? 3,
+    maxDailyLossUsd:      u.maxDailyLossUsd      ?? null,
+    // Correlated exposure cap: refuse deploy if total SOL across open positions would exceed this.
+    // null = disabled. Example: 3.0 means don't hold more than 3 SOL deployed at once.
+    maxTotalSolExposure:  u.maxTotalSolExposure   ?? null,
+    // Block new deploys if ALL open positions are currently out of range.
+    // Prevents adding capital when the entire portfolio is losing alignment.
+    blockDeployIfAllOOR:  u.blockDeployIfAllOOR   ?? false,
+    // Portfolio heat engine: each open position contributes a heat score.
+    // Heat per position = 1 (base) + 2 (if OOR) + 1 (if OOR >30min) + 1 (if pnl<-5%) + 1 (if pnl<-15%)
+    // Refuse new deploy if total heat >= maxPortfolioHeat. null = disabled.
+    // Example: maxPortfolioHeat=5 blocks deploy when two positions are OOR.
+    maxPortfolioHeat:     u.maxPortfolioHeat      ?? null,
+    // Consecutive OOR regime guard: pause deploy if last N closes were all out-of-range.
+    // Detects strong trending markets where DLMM LP keeps losing alignment. null = disabled.
+    // Example: 3 = block if last 3 closes were all OOR (within 48h window).
+    maxConsecutiveOorCloses: u.maxConsecutiveOorCloses ?? null,
+    // Wallet heat % gate (ke-15): block deploy if (deployed + new) / total wallet SOL > X%.
+    // More conservative than maxTotalSolExposure — scales with wallet size. null = disabled.
+    // Example: 70 = don't put more than 70% of total wallet into active DLMM positions.
+    maxWalletHeatPct: u.maxWalletHeatPct ?? null,
+    // Auto-flatten emergency threshold (ke-15): close ALL positions when portfolio heat reaches
+    // this level during a management cycle (without waiting for LLM). null = disabled.
+    // Uses same heat formula as maxPortfolioHeat. Set higher than maxPortfolioHeat to avoid
+    // triggering too early. Example: 15 = flatten when heat is severely elevated.
+    autoFlattenHeat: u.autoFlattenHeat ?? null,
+    // Stale screener fallback (executor_01): if the Pool Discovery API fails at deploy time,
+    // executor falls back to screener data in args. Set true to allow deploy even when screener
+    // fields are missing or timestamp is >120s old. Default false = strict mode (safer).
+    allowStaleScreenerFallback: u.allowStaleScreenerFallback ?? false,
   },
 
   // ─── Manual Approval ─────────────────────
@@ -99,6 +142,27 @@ export const config = {
     minTokenAgeHours:   u.minTokenAgeHours   ?? null, // null = no minimum
     maxTokenAgeHours:   u.maxTokenAgeHours   ?? null, // null = no maximum
     athFilterPct:       u.athFilterPct       ?? null, // e.g. -20 = only deploy if price is >= 20% below ATH
+    // Market regime gate: refuse deploy if pool volatility exceeds this value.
+    // Uses the 0–5+ volatility scale from screener. null = disabled.
+    // Example: 4.0 blocks deploys during extreme volatility expansions.
+    maxDeployVolatility: u.maxDeployVolatility ?? null,
+    // Toxic regime gate: refuse re-deploy into pools with chronic OOR history.
+    // If > this fraction of the pool's last 10 closes were out-of-range, block deploy.
+    // null = disabled. Example: 0.7 = block if 70%+ of recent closes were OOR.
+    maxOorRatioForRedeploy: u.maxOorRatioForRedeploy ?? null,
+    // Historical pool win rate gate: block re-deploy into pools with a poor adjusted win rate.
+    // Requires at least 3 samples. null = disabled. Example: 40 = block if win rate < 40%.
+    minPoolWinRate: u.minPoolWinRate ?? null,
+    // Hard scorer gate before LLM: candidates below this score are not shown to the agent.
+    // This prevents narrative/LLM optimism from deploying C/D-grade pools.
+    // null = disabled. Recommended dry-run/live profitability guard: 72+ (A-grade only).
+    minPoolScore: u.minPoolScore ?? null,
+    // Fee-vs-IL EV gate (ke-16): block deploys when projected daily net EV falls below this.
+    // EV = (fee_tvl_ratio × periods/day × 100%) − (binStep IL proxy + volatility IL proxy).
+    // blockNegativeEV=true + minNetEVPct=0 blocks any pool where IL estimate exceeds fee income.
+    // null minNetEVPct = disabled even when blockNegativeEV=true. Example: minNetEVPct=0.1.
+    blockNegativeEV: u.blockNegativeEV ?? false,
+    minNetEVPct:     u.minNetEVPct     ?? null,
   },
 
   // ─── Position Management ────────────────
@@ -130,6 +194,28 @@ export const config = {
     pnlSanityMaxDiffPct:   u.pnlSanityMaxDiffPct   ?? 5,    // max allowed diff between reported and derived pnl % before ignoring a tick
     // SOL mode — positions, PnL, and balances reported in SOL instead of USD
     solMode:               u.solMode               ?? false,
+    // Dynamic position sizing: scale deploy amount down as pool volatility increases.
+    // When enabled: scaleFactor = 1 - min(0.4, volatility × 0.08)
+    // Example: volatility=5 → deploy 60% of normal size. null/false = disabled.
+    volatilityPositionScaling: u.volatilityPositionScaling ?? false,
+    // Loss-triggered pool cooldown (ke-16): after a significant loss close, apply a cooldown
+    // to the pool so it isn't immediately redeployed into. Duration scales with loss severity.
+    // lossTriggeredCooldown: enable/disable. lossCooldownThresholdPct: trigger threshold (e.g. -15).
+    // lossCooldownHours: base hours per severity unit (severity = ceil(|pnl| / |threshold|), max 4).
+    lossTriggeredCooldown:      u.lossTriggeredCooldown      ?? false,
+    lossCooldownThresholdPct:   u.lossCooldownThresholdPct   ?? -15,
+    lossCooldownHours:          u.lossCooldownHours          ?? 6,
+    // Pool quality adaptive sizing (ke-14): scale down for pools with poor historical win rate.
+    // Uses adjusted_win_rate from pool-memory (excludes emergency closes). Requires ≥3 samples.
+    // qualityFactor range: 0.75 (worst history) → 1.0 (good/no history). false = disabled.
+    poolQualityPositionScaling: u.poolQualityPositionScaling ?? false,
+    // Fee yield upscaling (ke-14): deploy proportionally more in high-yield proven pools.
+    // Only activates when fee/TVL >= goodFeeMultiplier × minFeeActiveTvlRatio. Max +50%.
+    // Hard-capped at risk.maxDeployAmount. false = disabled.
+    feeYieldPositionScaling: u.feeYieldPositionScaling ?? false,
+    // Multiplier above minFeeActiveTvlRatio that defines "excellent fee yield" for upscaling.
+    // Example: 3.0 = a pool needs 3× the minimum fee/TVL before upscaling kicks in.
+    goodFeeMultiplier: u.goodFeeMultiplier ?? 3.0,
   },
 
   // ─── Strategy Mapping ───────────────────
@@ -155,6 +241,23 @@ export const config = {
     managementModel: u.managementModel ?? process.env.LLM_MODEL ?? "openrouter/healer-alpha",
     screeningModel:  u.screeningModel  ?? process.env.LLM_MODEL ?? "openrouter/hunter-alpha",
     generalModel:    u.generalModel    ?? process.env.LLM_MODEL ?? "openrouter/healer-alpha",
+    reviewModel:     u.aiReviewModel ?? u.reviewModel ?? "anthropic/claude-haiku-4.5",
+    hybridReviewEnabled: u.aiHybridReviewEnabled ?? true,
+    reviewMinPoolScore:  u.aiReviewMinPoolScore  ?? 72,
+    reviewMaxPerCycle:   u.aiReviewMaxPerCycle   ?? 1,
+    reviewMaxTokens:     u.aiReviewMaxTokens     ?? 384,
+    // AI spend guardrails. Keep monthlyBudgetUsd below the user's actual OpenRouter balance.
+    monthlyBudgetUsd: u.aiMonthlyBudgetUsd ?? 8,
+    dailyBudgetUsd:   u.aiDailyBudgetUsd   ?? 0.25,
+    maxCallsPerDay:   u.aiMaxCallsPerDay   ?? 20,
+    healthCheckEnabled: u.aiHealthCheckEnabled ?? false,
+    defaultInputPricePer1M:  u.aiDefaultInputPricePer1M  ?? 0.30,
+    defaultOutputPricePer1M: u.aiDefaultOutputPricePer1M ?? 1.20,
+  },
+
+  costs: {
+    estimatedRoundTripTxCostUsd: u.estimatedRoundTripTxCostUsd ?? 0.04,
+    includeAICostInNetPnl: u.includeAICostInNetPnl ?? true,
   },
 
   // ─── Darwinian Signal Weighting ───────

@@ -215,6 +215,18 @@ export function recordPoolDeploy(poolAddress, deployData) {
   log("pool-memory", `Recorded deploy for ${entry.name} (${poolAddress.slice(0, 8)}): PnL ${deploy.pnl_pct}%`);
 }
 
+// ke-16: allows executor.js to impose a cooldown after a severe loss close without
+// going through recordPoolDeploy (which requires a full deploy record).
+export function applyPoolCooldown(poolAddress, hours, reason) {
+  if (!poolAddress || !(hours > 0)) return null;
+  const db = load();
+  if (!db[poolAddress]) return null;
+  const until = setPoolCooldown(db[poolAddress], hours, reason);
+  save(db);
+  log("pool-memory", `Cooldown applied: ${poolAddress.slice(0, 8)} for ${hours}h (${reason})`);
+  return until;
+}
+
 export function isPoolOnCooldown(poolAddress) {
   if (!poolAddress) return false;
   const db = load();

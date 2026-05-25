@@ -128,15 +128,15 @@ function scoreTokenAge(pool, maxPts) {
 }
 
 function scoreVolatilityZone(pool, maxPts) {
-  // DLMM LP sweet spot: medium volatility (1-4%).
-  // Low = low fees. High/extreme = IL exceeds fees in most periods.
+  // DLMM LP sweet spot on Meridian's 0-5+ volatility scale.
+  // Low = low fees. High/extreme = IL/range drift can outrun fee yield.
   const v = Number(pool.volatility ?? 0);
   if (v <= 0) return 0;
-  if (v < 0.005) return maxPts * 0.3;          // low: fee income limited
-  if (v < 0.015) return maxPts * 0.75;         // low-medium: decent
-  if (v < 0.04)  return maxPts;                // medium: sweet spot
-  if (v < 0.08)  return maxPts * 0.5;          // high: risky but tradeable
-  return 0;                                     // extreme: IL likely exceeds fees
+  if (v < 0.75) return maxPts * 0.35;
+  if (v < 1.5)  return maxPts * 0.75;
+  if (v <= 3.5) return maxPts;
+  if (v <= 5)   return maxPts * 0.45;
+  return 0;
 }
 
 function scoreSmartMoney(pool, maxPts) {
@@ -219,9 +219,9 @@ function calcPenalties(pool, penaltyConfig) {
   if (!Number.isFinite(vol) || vol <= 0) {
     reasons.push({ reason: "volatility data unavailable", penalty: penaltyConfig.no_volatility });
     totalPenalty += penaltyConfig.no_volatility;
-  } else if (vol >= 0.10) {
+  } else if (vol > 5) {
     // Extreme volatility: IL will outrun fee yield in most 30m periods
-    reasons.push({ reason: `extreme volatility ${(vol * 100).toFixed(1)}% — IL risk very high`, penalty: penaltyConfig.extreme_volatility });
+    reasons.push({ reason: `extreme volatility ${vol.toFixed(2)} — IL risk very high`, penalty: penaltyConfig.extreme_volatility });
     totalPenalty += penaltyConfig.extreme_volatility;
   }
 
@@ -235,10 +235,10 @@ function calcPenalties(pool, penaltyConfig) {
 function classifyVolatility(volatility) {
   const v = Number(volatility ?? 0);
   if (v <= 0) return "unknown";
-  if (v < 0.01) return "low";       // <1% — low IL risk, but low fees
-  if (v < 0.04) return "medium";    // 1–4% — sweet spot for DLMM
-  if (v < 0.10) return "high";      // 4–10% — good fees, higher IL risk
-  return "extreme";                   // >10% — dangerous for LP
+  if (v < 0.75) return "low";
+  if (v <= 3.5) return "medium";
+  if (v <= 5) return "high";
+  return "extreme";
 }
 
 // ---------------------------------------------------------------------------

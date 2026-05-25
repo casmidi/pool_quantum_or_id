@@ -76,6 +76,32 @@ function loadPnlJson() {
   } catch { return null; }
 }
 
+function estimatedRoundTripCostUsd(cfg) {
+  const n = Number(cfg.estimatedRoundTripTxCostUsd ?? 0.04);
+  return Number.isFinite(n) && n > 0 ? n : 0;
+}
+
+function inferSolPrice(closed, cfg) {
+  const configured = Number(cfg.solPriceUsd ?? cfg.sol_price_usd ?? cfg.solPrice ?? 0);
+  if (Number.isFinite(configured) && configured > 0) return configured;
+  for (const t of closed) {
+    const pnlUsd = Math.abs(Number(t.pnl_usd ?? 0));
+    const pnlSol = Math.abs(Number(t.pnl_sol ?? 0));
+    if (pnlUsd > 0 && pnlSol > 0) return pnlUsd / pnlSol;
+  }
+  return 0;
+}
+
+function netPnlSolFromClosedTrades(closed, cfg) {
+  const solPrice = inferSolPrice(closed, cfg);
+  const implicitTxCostUsd = closed.reduce((sum, t) =>
+    sum + (t.costs_included_in_pnl ? 0 : estimatedRoundTripCostUsd(cfg)), 0);
+  const implicitTxCostSol = solPrice > 0 ? implicitTxCostUsd / solPrice : 0;
+  const pnlSol = closed.reduce((sum, t) =>
+    sum + (t.pnl_sol != null ? Number(t.pnl_sol) : ((Number(t.pnl_pct ?? 0) / 100) * Number(t.amount_sol ?? 0))), 0);
+  return pnlSol - implicitTxCostSol;
+}
+
 // Parse actions-*.jsonl — fallback saat pnl_log.json belum ada
 function parseActionsLogs(defaultSol) {
   const deploys = new Map(); // positionAddress → amountSol
@@ -120,9 +146,8 @@ function computeSummary() {
     const open   = pnlJson.trades.filter(t => t.status === 'open');
     const wins   = closed.filter(t => (t.pnl_pct ?? 0) > 0);
     const losses = closed.filter(t => (t.pnl_pct ?? 0) <= 0);
-    // Gunakan pnl_sol (SOL sejati) bila ada, fallback estimasi untuk record lama
-    const pnlSol = closed.reduce((s, t) =>
-      s + (t.pnl_sol != null ? t.pnl_sol : ((t.pnl_pct ?? 0) / 100) * (t.amount_sol ?? 0)), 0);
+    // Gunakan net PnL setelah estimasi biaya tx untuk record lama.
+    const pnlSol = netPnlSolFromClosedTrades(closed, cfg);
     return {
       initialSol: base,
       hasilPool:  pnlSol,

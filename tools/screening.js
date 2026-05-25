@@ -1171,7 +1171,17 @@ export async function getTopCandidates({ limit = 10 } = {}) {
         pushFilteredReason(filteredOut, pool, `pool scorer error: ${err.message}`);
       }
     }
-    eligible.splice(0, eligible.length, ...scoredEligible);
+    const minPoolScore = config.screening.minPoolScore;
+    const scoreGatedEligible = scoredEligible.filter((pool) => {
+      const score = Number(pool.pool_score ?? 0);
+      if (minPoolScore != null && Number.isFinite(minPoolScore) && score < minPoolScore) {
+        pushFilteredReason(filteredOut, pool, `pool score ${score} below minPoolScore ${minPoolScore}`);
+        log("screening", `Pool-score gate: dropped ${pool.name} — score ${score} < ${minPoolScore} (grade ${pool.pool_grade ?? "?"})`);
+        return false;
+      }
+      return true;
+    });
+    eligible.splice(0, eligible.length, ...scoreGatedEligible);
     eligible.sort((a, b) => (b.pool_score ?? 0) - (a.pool_score ?? 0));
     // Final trim to requested limit — done here, AFTER all risk/indicator filters
     eligible.splice(safeLimit);

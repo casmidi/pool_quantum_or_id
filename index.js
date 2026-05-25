@@ -2,10 +2,11 @@ import "./envcrypt.js";
 import cron from "node-cron";
 import readline from "readline";
 import path from "path";
+import fs from "fs";
 import { fileURLToPath } from "url";
-import { agentLoop } from "./agent.js";
+import { agentLoop, completeAI } from "./agent.js";
 import { log } from "./logger.js";
-import { getMyPositions, closePosition, getActiveBin } from "./tools/dlmm.js";
+import { getMyPositions, closePosition, getActiveBin, isSyntheticTxId } from "./tools/dlmm.js";
 import { getWalletBalances } from "./tools/wallet.js";
 import { getTopCandidates, shutdownScreening } from "./tools/screening.js";
 import { config, reloadScreeningThresholds, computeDeployAmount } from "./config.js";
@@ -41,10 +42,36 @@ const isMain = entrypointPath
   ? path.resolve(entrypointPath) === fileURLToPath(import.meta.url)
   : false;
 
+// P1: Process singleton guard — warn if another instance appears to be running.
+// Multi-process mode risks double-deploy/double-close since pending locks are in-memory per-process.
+const BOT_PID_FILE = process.env.BOT_PID_FILE || path.resolve(process.cwd(), ".bot.pid");
+function writePidFile() {
+  try { fs.writeFileSync(BOT_PID_FILE, String(process.pid), "utf8"); } catch { /* best effort */ }
+}
+function removePidFile() {
+  try { if (fs.existsSync(BOT_PID_FILE)) fs.unlinkSync(BOT_PID_FILE); } catch { /* best effort */ }
+}
+function checkSingletonGuard() {
+  try {
+    if (!fs.existsSync(BOT_PID_FILE)) return;
+    const existingPid = parseInt(fs.readFileSync(BOT_PID_FILE, "utf8").trim(), 10);
+    if (!existingPid || existingPid === process.pid) return;
+    try {
+      process.kill(existingPid, 0); // signal 0 = existence check, throws if PID not running
+      log("startup_warn", `Another bot instance may be running (PID ${existingPid}). Multi-process mode is NOT safe — pending locks are per-process and double-deploy/close is possible. Stop the other instance before proceeding.`);
+    } catch {
+      log("startup", `Stale PID file (PID ${existingPid} no longer running) — cleaning up and continuing.`);
+      removePidFile();
+    }
+  } catch { /* ignore errors reading pid file */ }
+}
+
 if (isMain) {
+  checkSingletonGuard();
+  writePidFile();
   log("startup", "DLMM LP Agent starting...");
   log("startup", `Mode: ${process.env.DRY_RUN === "true" ? "DRY RUN" : "LIVE"}`);
-  log("startup", `Model: ${process.env.LLM_MODEL || "hermes-3-405b"}`);
+  log("startup", `Models: screening=${config.llm.screeningModel}, management=${config.llm.managementModel}, general=${config.llm.generalModel}, review=${config.llm.reviewModel}`);
   ensureAgentId();
   bootstrapHiveMind().catch((error) => log("hivemind_warn", `Bootstrap failed: ${error.message}`));
   startHiveMindBackgroundSync();
@@ -83,13 +110,18 @@ function getDryRunPositionsSnapshot() {
       base_mint: trade.base_mint ?? null,
       pair: trade.pool_name || trade.pool_address?.slice(0, 8) || "dry-run",
       amount_sol: Number(trade.amount_sol ?? 0),
-      total_value_sol: Number(trade.amount_sol ?? 0),
-      total_value_usd: Number(trade.amount_sol ?? 0),
-      pnl_usd: 0,
-      pnl_pct: 0,
+      total_value_sol: Number(trade.amount_sol ?? 0) + Number(trade.paper_unrealized_pnl_sol ?? 0),
+      total_value_usd: Number(trade.amount_sol ?? 0) + Number(trade.paper_unrealized_pnl_sol ?? 0),
+      pnl_usd: Number(trade.paper_unrealized_pnl_sol ?? 0),
+      pnl_pct: Number(trade.paper_unrealized_pnl_pct ?? 0),
       unclaimed_fees_usd: 0,
       age_minutes: ageMinutes,
-      in_range: true,
+      in_range: trade.in_range ?? true,
+      lower_bin: trade.lower_bin ?? null,
+      upper_bin: trade.upper_bin ?? null,
+      active_bin: trade.active_bin ?? null,
+      minutes_out_of_range: trade.minutes_out_of_range ?? 0,
+      fee_per_tvl_24h: trade.fee_per_tvl_24h ?? null,
       dry_run: true,
       target_close_minutes: trade.target_close_minutes ?? null,
     };
@@ -160,6 +192,84 @@ function sanitizeUntrustedPromptText(text, maxLen = 500) {
     .trim()
     .slice(0, maxLen);
   return cleaned ? JSON.stringify(cleaned) : null;
+}
+
+function candidateScore(pool) {
+  const score = Number(pool?.pool_score ?? pool?.score ?? pool?.quality_score);
+  return Number.isFinite(score) ? score : 0;
+}
+
+function parseHybridReview(content) {
+  const raw = String(content || "").trim();
+  const unfenced = raw.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "").trim();
+  const jsonText = unfenced.match(/\{[\s\S]*\}/)?.[0] || unfenced;
+  try {
+    const parsed = JSON.parse(jsonText);
+    const decision = String(parsed.decision || "").toUpperCase();
+    return {
+      approved: decision === "APPROVE",
+      reason: String(parsed.reason || raw).slice(0, 400),
+    };
+  } catch {
+    return {
+      approved: /\bAPPROVE\b/i.test(raw) && !/\bREJECT\b/i.test(raw),
+      reason: raw.slice(0, 400) || "Claude review returned an unreadable response",
+    };
+  }
+}
+
+async function reviewDeployWithHybridAI({ pool, candidateBlock, deployArgs, deployAmount, strategyBlock }) {
+  if (!config.llm.hybridReviewEnabled) return { allowed: true, reason: "hybrid review disabled" };
+
+  const score = candidateScore(pool);
+  const minScore = Number(config.llm.reviewMinPoolScore ?? 70);
+  if (score < minScore) {
+    return {
+      allowed: false,
+      reason: `Hybrid review blocked ${pool?.name || deployArgs?.pool_address}: pool score ${score} < Claude review threshold ${minScore}`,
+    };
+  }
+
+  const model = config.llm.reviewModel;
+  log("hybrid_review", `Claude review requested for ${pool?.name || deployArgs?.pool_address} (score ${score}, model ${model})`);
+  const response = await completeAI({
+    model,
+    agentType: "REVIEWER",
+    maxTokens: config.llm.reviewMaxTokens,
+    temperature: 0.1,
+    messages: [
+      {
+        role: "system",
+        content: [
+          "You are the final risk reviewer for a Meteora DLMM pool bot.",
+          "Be conservative: approve only if the candidate has a clear edge after AI cost, pool risk, volatility, and likely impermanent loss.",
+          "Return exactly JSON: {\"decision\":\"APPROVE\"|\"REJECT\",\"reason\":\"short reason\"}.",
+        ].join(" "),
+      },
+      {
+        role: "user",
+        content: [
+          `Deploy amount: ${deployAmount} SOL`,
+          `Strategy: ${strategyBlock}`,
+          `Candidate score: ${score}`,
+          `Proposed deploy args: ${JSON.stringify(deployArgs)}`,
+          "",
+          "Candidate data:",
+          candidateBlock || JSON.stringify(pool || {}),
+        ].join("\n"),
+      },
+    ],
+  });
+
+  if (response.budget_blocked) {
+    return { allowed: false, reason: response.content };
+  }
+  const decision = parseHybridReview(response.content);
+  log("hybrid_review", `${pool?.name || deployArgs?.pool_address}: ${decision.approved ? "APPROVE" : "REJECT"} — ${decision.reason}`);
+  return {
+    allowed: decision.approved,
+    reason: `Claude ${decision.approved ? "approved" : "rejected"}: ${decision.reason}`,
+  };
 }
 
 function shouldUsePnlRecheck() {
@@ -262,7 +372,7 @@ export async function runManagementCycle({ silent = false } = {}) {
       liveMessage = await createLiveMessage("🔄 Management Cycle", "Evaluating positions...");
     }
     if (isDryRunMode()) {
-      const closed = simulateDryRunCloses({});
+      const closed = await simulateDryRunCloses({});
       const sim = getSummary();
       if (closed > 0) {
         log("cron", `Dry-run simulation closed ${closed} position(s); balance ${sim.current_sol} SOL`);
@@ -287,6 +397,41 @@ export async function runManagementCycle({ silent = false } = {}) {
       mgmtReport = "No open positions. Triggering screening cycle.";
       runScreeningCycle().catch((e) => log("cron_error", `Triggered screening failed: ${e.message}`));
       return mgmtReport;
+    }
+
+    // P1 (ke-15): Auto-flatten emergency trigger — close all positions when portfolio heat
+    // reaches a critical threshold, without waiting for LLM decision.
+    // Uses same heat formula as executor.js maxPortfolioHeat check.
+    const autoFlattenThreshold = config.risk.autoFlattenHeat;
+    if (autoFlattenThreshold != null && Number.isFinite(autoFlattenThreshold) && positions.length > 0) {
+      let flattenHeat = 0;
+      for (const p of positions) {
+        let h = 1;
+        if (p.in_range === false) h += 2;
+        if (p.in_range === false && (p.minutes_out_of_range ?? 0) > 30) h += 1;
+        const pnl = p.pnl_pct ?? 0;
+        if (pnl < -5)  h += 1;
+        if (pnl < -15) h += 1;
+        flattenHeat += h;
+      }
+      if (flattenHeat >= autoFlattenThreshold) {
+        log("cron", `Auto-flatten: portfolio heat ${flattenHeat} >= threshold ${autoFlattenThreshold} — closing all ${positions.length} positions`);
+        try {
+          const flatResult = await executeTool("close_all_positions", {
+            reason: `auto_flatten: portfolio heat ${flattenHeat} exceeded emergency threshold ${autoFlattenThreshold}`,
+            skip_swap: false,
+          });
+          const closed = flatResult?.closed_count ?? 0;
+          const failed = flatResult?.failed_count ?? 0;
+          mgmtReport = `[AUTO-FLATTEN] Portfolio heat ${flattenHeat} triggered emergency close. Closed ${closed}/${positions.length} positions${failed > 0 ? `, ${failed} failed` : ""}.`;
+          log("cron", mgmtReport);
+          if (telegramEnabled()) sendMessage(mgmtReport).catch(() => {});
+          return mgmtReport;
+        } catch (e) {
+          log("cron_error", `Auto-flatten failed: ${e.message}`);
+          // Don't abort — fall through to normal management cycle
+        }
+      }
     }
 
     // Snapshot + load pool memory
@@ -688,6 +833,11 @@ export async function runScreeningCycle({ silent = false } = {}) {
     });
 
     const weightsSummary = config.darwin?.enabled ? getWeightsSummary() : null;
+    const candidateByPool = new Map(passing.map((entry) => [entry.pool.pool, entry]));
+    const candidateBlockByPool = new Map(
+      passing.map((entry, i) => [entry.pool.pool, candidateBlocks[i]])
+    );
+    let hybridReviewsThisCycle = 0;
 
     let deployAttempted = false;
     let deploySucceeded = false;
@@ -769,6 +919,36 @@ IMPORTANT:
         onToolStart: async ({ name }) => {
           if (name === "deploy_position") deployAttempted = true;
           await liveMessage?.toolStart(name);
+        },
+        beforeToolCall: async ({ name, args }) => {
+          if (name !== "deploy_position") return { allowed: true };
+          if (!config.llm.hybridReviewEnabled) return { allowed: true };
+
+          const poolAddress = args?.pool_address;
+          const candidate = candidateByPool.get(poolAddress);
+          if (!candidate) {
+            return {
+              allowed: false,
+              reason: `Hybrid review blocked deploy: ${poolAddress || "unknown pool"} was not in the pre-scored candidate set`,
+            };
+          }
+
+          const maxReviews = Number(config.llm.reviewMaxPerCycle ?? 1);
+          if (Number.isFinite(maxReviews) && maxReviews > 0 && hybridReviewsThisCycle >= maxReviews) {
+            return {
+              allowed: false,
+              reason: `Hybrid review blocked deploy: Claude review cap reached (${hybridReviewsThisCycle}/${maxReviews} this cycle)`,
+            };
+          }
+          hybridReviewsThisCycle += 1;
+
+          return reviewDeployWithHybridAI({
+            pool: candidate.pool,
+            candidateBlock: candidateBlockByPool.get(poolAddress),
+            deployArgs: args,
+            deployAmount,
+            strategyBlock,
+          });
         },
         onToolFinish: async ({ name, result, success }) => {
           if (name === "deploy_position") {
@@ -854,6 +1034,10 @@ export function startCronJobs() {
   const screenTask = cron.schedule(`*/${Math.max(1, config.schedule.screeningIntervalMin)} * * * *`, runScreeningCycle);
 
   const healthTask = cron.schedule(`0 * * * *`, async () => {
+    if (!config.llm.healthCheckEnabled) {
+      log("cron", "AI health check skipped (aiHealthCheckEnabled=false)");
+      return;
+    }
     if (_managementBusy) return;
     _managementBusy = true;
     log("cron", "Starting health check");
@@ -887,7 +1071,7 @@ Summarize the current portfolio health, total fees earned, and performance of al
     _pnlPollBusy = true;
     try {
       if (isDryRunMode()) {
-        const closed = simulateDryRunCloses({});
+        const closed = await simulateDryRunCloses({});
         if (closed > 0) {
           const sim = getSummary();
           log("state", `[Dry-run poll] Closed ${closed} simulated position(s); balance ${sim.current_sol} SOL`);
@@ -989,6 +1173,7 @@ async function shutdown(signal) {
   } else {
     log("shutdown", "Open position snapshot skipped during shutdown timeout");
   }
+  removePidFile();
   process.exit(0);
 }
 
@@ -1651,8 +1836,9 @@ async function telegramHandler(msg) {
       const result = await closePosition({ position_address: pos.position });
       if (result.success) {
         const closeTxs = result.close_txs?.length ? result.close_txs : result.txs;
-        const claimNote = result.claim_txs?.length ? `\nClaim txs: ${result.claim_txs.join(", ")}` : "";
-        await sendMessage(`✅ Closed ${pos.pair}\nPnL: ${config.management.solMode ? "◎" : "$"}${result.pnl_usd ?? "?"} | close txs: ${closeTxs?.join(", ") || "n/a"}${claimNote}`);
+        const formatTx = (tx) => isSyntheticTxId(tx) ? `[reconciled]` : tx;
+        const claimNote = result.claim_txs?.length ? `\nClaim txs: ${result.claim_txs.map(formatTx).join(", ")}` : "";
+        await sendMessage(`✅ Closed ${pos.pair}\nPnL: ${config.management.solMode ? "◎" : "$"}${result.pnl_usd ?? "?"} | close txs: ${closeTxs?.map(formatTx).join(", ") || "n/a"}${claimNote}`);
       } else {
         await sendMessage(`❌ Close failed: ${JSON.stringify(result)}`);
       }
@@ -1743,7 +1929,7 @@ async function telegramHandler(msg) {
         `Amount: ${deployAmount} SOL`,
         coverage,
         `Position: ${result.position || "n/a"}`,
-        result.txs?.length ? `Tx: ${result.txs[0]}` : null,
+        result.txs?.length ? `Tx: ${isSyntheticTxId(result.txs[0]) ? "[reconciled]" : result.txs[0]}` : null,
       ].filter(Boolean).join("\n")).catch(() => {});
     } catch (e) {
       await sendMessage(`Error: ${e.message}`).catch(() => {});

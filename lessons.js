@@ -109,21 +109,30 @@ export async function recordPerformance(perf) {
     return;
   }
 
+  // P1: Low-confidence PnL (fallback cache, not settled closed API) must not be used
+  // to derive lessons or evolve thresholds — doing so would teach the bot from bad data.
+  // The record is still stored (audit trail) but flagged to exclude from training.
+  const isLowConfidence = perf.pnl_confidence && perf.pnl_confidence !== "high";
+
   const entry = {
     ...perf,
     pnl_usd: Math.round(pnl_usd * 100) / 100,
     pnl_pct: Math.round(pnl_pct * 100) / 100,
     range_efficiency: Math.round(range_efficiency * 10) / 10,
     recorded_at: new Date().toISOString(),
+    exclude_from_training: isLowConfidence ? true : undefined,
   };
 
   data.performance.push(entry);
 
-  // Derive and store a lesson
-  const lesson = derivLesson(entry);
+  // Derive and store a lesson — only for high-confidence records
+  const lesson = isLowConfidence ? null : derivLesson(entry);
   if (lesson) {
     data.lessons.push(lesson);
     log("lessons", `New lesson: ${lesson.rule}`);
+  }
+  if (isLowConfidence) {
+    log("lessons_warn", `Low-confidence PnL for ${perf.pool_name || perf.pool} (source: ${perf.pnl_source}) — stored for audit but excluded from lesson derivation and threshold evolution.`);
   }
 
   save(data);
@@ -286,8 +295,13 @@ function derivLesson(perf) {
 export function evolveThresholds(perfData, config) {
   if (!perfData || perfData.length < MIN_EVOLVE_POSITIONS) return null;
 
-  const winners = perfData.filter((p) => p.pnl_pct > 0);
-  const losers  = perfData.filter((p) => p.pnl_pct < -5);
+  // P1: Exclude low-confidence records (fallback cache PnL) from threshold evolution.
+  // Training on unsettled/fallback data would bias the screener thresholds incorrectly.
+  const trainingData = perfData.filter((p) => !p.exclude_from_training);
+  if (trainingData.length < MIN_EVOLVE_POSITIONS) return null;
+
+  const winners = trainingData.filter((p) => p.pnl_pct > 0);
+  const losers  = trainingData.filter((p) => p.pnl_pct < -5);
 
   // Need at least some signal in both directions before adjusting
   const hasSignal = winners.length >= 2 || losers.length >= 2;
@@ -296,13 +310,15 @@ export function evolveThresholds(perfData, config) {
   const changes   = {};
   const rationale = {};
 
-  // ── 1. maxVolatility ─────────────────────────────────────────
+  // ── 1. maxDeployVolatility ───────────────────────────────────
   // If losers tend to cluster at higher volatility → tighten the ceiling.
   // If winners span higher volatility safely → we can loosen a bit.
+  // Bug fix (ke-14): was reading config.screening.maxVolatility (undefined key) and writing
+  // changes.maxVolatility — which config.js never reads back. Corrected to maxDeployVolatility.
   {
     const winnerVols = winners.map((p) => p.volatility).filter(isFiniteNum);
     const loserVols  = losers.map((p) => p.volatility).filter(isFiniteNum);
-    const current    = config.screening.maxVolatility;
+    const current    = config.screening.maxDeployVolatility ?? 5.0; // bootstrap default when unset
 
     if (loserVols.length >= 2) {
       // 25th percentile of loser volatilities — this is where things start going wrong
@@ -313,8 +329,8 @@ export function evolveThresholds(perfData, config) {
         const newVal  = clamp(nudge(current, target, MAX_CHANGE_PER_STEP), 1.0, 20.0);
         const rounded = Number(newVal.toFixed(1));
         if (rounded < current) {
-          changes.maxVolatility = rounded;
-          rationale.maxVolatility = `Losers clustered at volatility ~${loserP25.toFixed(1)} — tightened from ${current} → ${rounded}`;
+          changes.maxDeployVolatility = rounded;
+          rationale.maxDeployVolatility = `Losers clustered at volatility ~${loserP25.toFixed(1)} — tightened from ${current} → ${rounded}`;
         }
       }
     } else if (winnerVols.length >= 3 && losers.length === 0) {
@@ -325,19 +341,21 @@ export function evolveThresholds(perfData, config) {
         const newVal  = clamp(nudge(current, target, MAX_CHANGE_PER_STEP), 1.0, 20.0);
         const rounded = Number(newVal.toFixed(1));
         if (rounded > current) {
-          changes.maxVolatility = rounded;
-          rationale.maxVolatility = `All ${winners.length} positions profitable — loosened from ${current} → ${rounded}`;
+          changes.maxDeployVolatility = rounded;
+          rationale.maxDeployVolatility = `All ${winners.length} positions profitable — loosened from ${current} → ${rounded}`;
         }
       }
     }
   }
 
-  // ── 2. minFeeTvlRatio ─────────────────────────────────────────
+  // ── 2. minFeeActiveTvlRatio ───────────────────────────────────
   // Raise the floor if low-fee pools consistently underperform.
+  // Bug fix (ke-14): was reading config.screening.minFeeTvlRatio (undefined key) and writing
+  // changes.minFeeTvlRatio — which config.js never reads back. Corrected to minFeeActiveTvlRatio.
   {
     const winnerFees = winners.map((p) => p.fee_tvl_ratio).filter(isFiniteNum);
     const loserFees  = losers.map((p) => p.fee_tvl_ratio).filter(isFiniteNum);
-    const current    = config.screening.minFeeTvlRatio;
+    const current    = config.screening.minFeeActiveTvlRatio ?? 0.05;
 
     if (winnerFees.length >= 2) {
       // Minimum fee/TVL among winners — we know pools below this don't work for us
@@ -347,8 +365,8 @@ export function evolveThresholds(perfData, config) {
         const newVal  = clamp(nudge(current, target, MAX_CHANGE_PER_STEP), 0.05, 10.0);
         const rounded = Number(newVal.toFixed(2));
         if (rounded > current) {
-          changes.minFeeTvlRatio = rounded;
-          rationale.minFeeTvlRatio = `Lowest winner fee_tvl=${minWinnerFee.toFixed(2)} — raised floor from ${current} → ${rounded}`;
+          changes.minFeeActiveTvlRatio = rounded;
+          rationale.minFeeActiveTvlRatio = `Lowest winner fee_tvl=${minWinnerFee.toFixed(2)} — raised floor from ${current} → ${rounded}`;
         }
       }
     }
@@ -363,9 +381,9 @@ export function evolveThresholds(perfData, config) {
           const target  = maxLoserFee * 1.2;
           const newVal  = clamp(nudge(current, target, MAX_CHANGE_PER_STEP), 0.05, 10.0);
           const rounded = Number(newVal.toFixed(2));
-          if (rounded > current && !changes.minFeeTvlRatio) {
-            changes.minFeeTvlRatio = rounded;
-            rationale.minFeeTvlRatio = `Losers had fee_tvl<=${maxLoserFee.toFixed(2)}, winners higher — raised floor from ${current} → ${rounded}`;
+          if (rounded > current && !changes.minFeeActiveTvlRatio) {
+            changes.minFeeActiveTvlRatio = rounded;
+            rationale.minFeeActiveTvlRatio = `Losers had fee_tvl<=${maxLoserFee.toFixed(2)}, winners higher — raised floor from ${current} → ${rounded}`;
           }
         }
       }
@@ -412,9 +430,9 @@ export function evolveThresholds(perfData, config) {
 
   // Apply to live config object immediately
   const s = config.screening;
-  if (changes.maxVolatility    != null) s.maxVolatility    = changes.maxVolatility;
-  if (changes.minFeeTvlRatio   != null) s.minFeeTvlRatio   = changes.minFeeTvlRatio;
-  if (changes.minOrganic       != null) s.minOrganic       = changes.minOrganic;
+  if (changes.maxDeployVolatility    != null) s.maxDeployVolatility    = changes.maxDeployVolatility;
+  if (changes.minFeeActiveTvlRatio   != null) s.minFeeActiveTvlRatio   = changes.minFeeActiveTvlRatio;
+  if (changes.minOrganic             != null) s.minOrganic             = changes.minOrganic;
 
   // Log a lesson summarizing the evolution
   const data = load();

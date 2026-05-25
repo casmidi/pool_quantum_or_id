@@ -4,7 +4,7 @@ import { buildSystemPrompt } from "./prompt.js";
 import { executeTool } from "./tools/executor.js";
 import { tools } from "./tools/definitions.js";
 
-const MANAGER_TOOLS  = new Set(["close_position", "claim_fees", "swap_token", "get_position_pnl", "get_my_positions", "get_wallet_balance"]);
+const MANAGER_TOOLS  = new Set(["close_position", "claim_fees", "close_all_positions", "swap_token", "get_position_pnl", "get_my_positions", "get_wallet_balance"]);
 const SCREENER_TOOLS = new Set(["deploy_position", "get_active_bin", "get_top_candidates", "check_smart_wallets_on_pool", "get_token_holders", "get_token_narrative", "get_token_info", "search_pools", "get_pool_memory", "get_wallet_balance", "get_my_positions"]);
 const GENERAL_INTENT_ONLY_TOOLS = new Set([
   "self_update",
@@ -30,7 +30,7 @@ const GENERAL_INTENT_ONLY_TOOLS = new Set([
 const INTENT_TOOLS = {
   decisions:   new Set(["get_recent_decisions"]),
   deploy:      new Set(["deploy_position", "get_top_candidates", "get_active_bin", "get_pool_memory", "check_smart_wallets_on_pool", "get_token_holders", "get_token_narrative", "get_token_info", "search_pools", "get_wallet_balance", "get_my_positions", "add_pool_note"]),
-  close:       new Set(["close_position", "get_my_positions", "get_position_pnl", "get_wallet_balance", "swap_token"]),
+  close:       new Set(["close_position", "close_all_positions", "get_my_positions", "get_position_pnl", "get_wallet_balance", "swap_token"]),
   claim:       new Set(["claim_fees", "get_my_positions", "get_position_pnl", "get_wallet_balance"]),
   swap:        new Set(["swap_token", "get_wallet_balance"]),
   config:      new Set(["update_config"]),
@@ -87,6 +87,7 @@ import { getWalletBalances } from "./tools/wallet.js";
 import { getMyPositions } from "./tools/dlmm.js";
 import { log } from "./logger.js";
 import { config } from "./config.js";
+import { canCallAI, recordAIUsage } from "./ai-budget.js";
 import { getStateSummary } from "./state.js";
 import { getLessonsForPrompt, getPerformanceSummary } from "./lessons.js";
 import { getDecisionSummary } from "./decision-log.js";
@@ -149,8 +150,37 @@ function isToolChoiceRequiredError(error) {
  * @param {number} maxSteps - Safety limit on iterations (default 20)
  * @returns {string} - The agent's final text response
  */
+export async function completeAI({ model = null, agentType = "GENERAL", messages = [], maxTokens = 512, temperature = config.llm.temperature } = {}) {
+  const activeModel = model || DEFAULT_MODEL;
+  const budgetCheck = canCallAI({ model: activeModel, agentType });
+  if (!budgetCheck.allowed) {
+    log("ai_budget_warn", budgetCheck.reason);
+    return {
+      content: `AI paused by budget guard: ${budgetCheck.reason}`,
+      budget_blocked: true,
+    };
+  }
+
+  const response = await client.chat.completions.create({
+    model: activeModel,
+    messages,
+    temperature,
+    max_tokens: maxTokens,
+  });
+
+  if (!response.choices?.length) {
+    throw new Error(`API returned no choices: ${response.error?.message || JSON.stringify(response)}`);
+  }
+  recordAIUsage({ model: activeModel, agentType, usage: response.usage || {} });
+  return {
+    content: response.choices[0].message?.content || "",
+    usage: response.usage || {},
+    model: activeModel,
+  };
+}
+
 export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHistory = [], agentType = "GENERAL", model = null, maxOutputTokens = null, options = {}) {
-  const { interactive = false, onToolStart = null, onToolFinish = null } = options;
+  const { interactive = false, onToolStart = null, onToolFinish = null, beforeToolCall = null } = options;
   // Build dynamic system prompt with current portfolio state
   const [portfolio, positions] = await Promise.all([getWalletBalances(), getMyPositions()]);
   const stateSummary = getStateSummary();
@@ -172,7 +202,7 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
 
   // Track write tools fired this session — prevent the model from calling the same
   // destructive tool twice (e.g. deploy twice, swap twice after auto-swap)
-  const ONCE_PER_SESSION = new Set(["deploy_position", "swap_token", "close_position"]);
+  const ONCE_PER_SESSION = new Set(["deploy_position", "swap_token", "close_position", "close_all_positions"]);
   // These lock after first attempt regardless of success — retrying them is always wrong
   const NO_RETRY_TOOLS = new Set(["deploy_position"]);
   const firedOnce = new Set();
@@ -186,6 +216,15 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
 
     try {
       const activeModel = model || DEFAULT_MODEL;
+      const budgetCheck = canCallAI({ model: activeModel, agentType });
+      if (!budgetCheck.allowed) {
+        log("ai_budget_warn", budgetCheck.reason);
+        return {
+          content: `AI paused by budget guard: ${budgetCheck.reason}`,
+          userMessage: goal,
+          budget_blocked: true,
+        };
+      }
 
       // Retry up to 3 times on transient provider errors (502, 503, 529)
       const FALLBACK_MODEL = "stepfun/step-3.5-flash:free";
@@ -241,6 +280,7 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
         log("error", `Bad API response: ${JSON.stringify(response).slice(0, 200)}`);
         throw new Error(`API returned no choices: ${response.error?.message || JSON.stringify(response)}`);
       }
+      recordAIUsage({ model: usedModel, agentType, usage: response.usage || {} });
       const msg = response.choices[0].message;
       const invalidToolArgErrors = new Map();
       // Keep tool-call history API-valid, but never execute unrecoverable args.
@@ -353,6 +393,25 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
             tool_call_id: toolCall.id,
             content: JSON.stringify({ blocked: true, reason: `${functionName} already attempted this session — do not retry. If it failed, report the error and stop.` }),
           };
+        }
+
+        if (beforeToolCall) {
+          const gate = await beforeToolCall({ name: functionName, args: functionArgs, step });
+          if (gate?.allowed === false) {
+            const result = {
+              success: false,
+              blocked: true,
+              reason: gate.reason || `${functionName} blocked by pre-tool gate`,
+            };
+            log("agent", `Blocked ${functionName}: ${result.reason}`);
+            await onToolFinish?.({ name: functionName, args: functionArgs, result, success: false, step });
+            if (NO_RETRY_TOOLS.has(functionName)) firedOnce.add(functionName);
+            return {
+              role: "tool",
+              tool_call_id: toolCall.id,
+              content: JSON.stringify(result),
+            };
+          }
         }
 
         await onToolStart?.({ name: functionName, args: functionArgs, step });

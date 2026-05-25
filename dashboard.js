@@ -31,6 +31,7 @@ const PATHS = {
   logsDir: path.join(BOT_DIR, "logs"),
   dotenv: path.join(BOT_DIR, ".env"),
   pnlLog: path.join(BOT_DIR, "data", "pnl_log.json"),
+  aiUsage: path.join(BOT_DIR, "data", "ai_usage.json"),
 };
 
 // ── CORS ──────────────────────────────────────────────────────────────────────
@@ -255,7 +256,13 @@ function calcDailyPnl(decisions) {
   return pnlByDay;
 }
 
-function calcPnlSummary(config = {}) {
+function getCurrentMonthAICostUsd() {
+  const usage = readJSON(PATHS.aiUsage, { months: {} });
+  const monthKey = new Date().toISOString().slice(0, 7);
+  return Number(usage?.months?.[monthKey]?.cost_usd ?? 0) || 0;
+}
+
+function calcPnlSummary(config = {}, solPrice = 0) {
   const pnl = readJSON(PATHS.pnlLog, { trades: [] });
   const allTrades = pnl.trades || [];
   // In LIVE mode only count real trades; in dry-run only count simulated trades
@@ -277,27 +284,48 @@ function calcPnlSummary(config = {}) {
     : Number.isFinite(storedInitial) && storedInitial > 0
       ? storedInitial
       : fallbackInitial;
-  const pnlSol = closed.reduce((sum, t) => {
+  const pnlSolRaw = closed.reduce((sum, t) => {
     const explicit = Number(t.pnl_sol);
     if (Number.isFinite(explicit)) return sum + explicit;
     return sum + (Number(t.pnl_pct || 0) / 100) * Number(t.amount_sol || 0);
   }, 0);
   const pnlUsd = closed.reduce((sum, t) => sum + Number(t.pnl_usd || 0), 0);
+  const estimatedRoundTripCostUsd = Number(config.estimatedRoundTripTxCostUsd ?? 0.04);
+  const implicitTxCostUsd = closed.reduce((sum, t) => (
+    sum + (t.costs_included_in_pnl ? 0 : (Number.isFinite(estimatedRoundTripCostUsd) ? estimatedRoundTripCostUsd : 0))
+  ), 0);
+  const explicitTxCostUsd = closed.reduce((sum, t) => sum + Number(t.costs_usd || 0), 0);
+  const aiCostUsd = config.includeAICostInNetPnl === false ? 0 : getCurrentMonthAICostUsd();
+  const netCostUsd = implicitTxCostUsd + aiCostUsd;
+  const netCostSol = solPrice > 0 ? netCostUsd / solPrice : 0;
+  const pnlSol = pnlSolRaw - netCostSol;
+  const netPnlUsd = pnlUsd - netCostUsd;
   const locked = open.reduce((sum, t) => sum + Number(t.amount_sol || 0), 0);
   const current = initial + pnlSol - locked;
   const wins = closed.filter(t => Number(t.pnl_pct || 0) > 0);
   const losses = closed.filter(t => Number(t.pnl_pct || 0) <= 0);
   const daily = {};
+  let lastClosedDay = null;
   for (const t of closed) {
     const day = String(t.close_time || t.deploy_time || "").slice(0, 10);
     if (!day) continue;
-    daily[day] = (daily[day] || 0) + Number(t.pnl_usd || 0);
+    lastClosedDay = day;
+    const implicitCost = t.costs_included_in_pnl ? 0 : (Number.isFinite(estimatedRoundTripCostUsd) ? estimatedRoundTripCostUsd : 0);
+    daily[day] = (daily[day] || 0) + Number(t.pnl_usd || 0) - implicitCost;
+  }
+  if (aiCostUsd > 0) {
+    const costDay = lastClosedDay || pnl.last_updated?.slice?.(0, 10) || new Date().toISOString().slice(0, 10);
+    daily[costDay] = (daily[costDay] || 0) - aiCostUsd;
   }
   return {
     initial: Math.round(initial * 10000) / 10000,
     current: Math.round(current * 10000) / 10000,
     pnl: Math.round(pnlSol * 10000) / 10000,
-    pnlUsd: Math.round(pnlUsd * 100) / 100,
+    pnlUsd: Math.round(netPnlUsd * 100) / 100,
+    grossPnlUsd: Math.round(pnlUsd * 100) / 100,
+    costsUsd: Math.round((netCostUsd + explicitTxCostUsd) * 10000) / 10000,
+    aiCostUsd: Math.round(aiCostUsd * 10000) / 10000,
+    txCostUsd: Math.round((implicitTxCostUsd + explicitTxCostUsd) * 10000) / 10000,
     locked: Math.round(locked * 10000) / 10000,
     total: closed.length,
     open: open.length,
@@ -336,7 +364,7 @@ app.get("/api/status", async (req, res) => {
     const config = readJSON(PATHS.userConfig, {});
     const signals = readJSON(PATHS.signals, {});
     const positions = state.positions || {};
-    const pnlSummary = calcPnlSummary(config);
+    const pnlSummary = calcPnlSummary(config, solPrice);
     const isDryRun = botInfo.mode !== "LIVE";
 
     res.json({
@@ -385,7 +413,11 @@ app.get("/api/status", async (req, res) => {
           current: pnlSummary.current,
           pnl:     pnlSummary.pnl,
           locked:  pnlSummary.locked,
-          pnlUsd:  Math.round(pnlSummary.pnl * solPrice * 100) / 100,
+          pnlUsd:  pnlSummary.pnlUsd,
+          grossPnlUsd: pnlSummary.grossPnlUsd,
+          costsUsd: pnlSummary.costsUsd,
+          aiCostUsd: pnlSummary.aiCostUsd,
+          txCostUsd: pnlSummary.txCostUsd,
           solPrice,
           mode:    botInfo.mode,
           lastUpdated: pnlSummary.lastUpdated,
@@ -447,7 +479,7 @@ app.get("/api/logs", (req, res) => {
 app.get("/api/pnl", async (req, res) => {
   const solPrice = await fetchSolPrice();
   const config = readJSON(PATHS.userConfig, {});
-  const pnlSummary = calcPnlSummary(config);
+  const pnlSummary = calcPnlSummary(config, solPrice);
   const dec = readJSON(PATHS.decisions, { decisions: [] });
   const decisionDaily = calcDailyPnl(dec.decisions || []);
   const daily = Object.keys(pnlSummary.daily).length ? pnlSummary.daily : decisionDaily;
@@ -467,6 +499,9 @@ app.get("/api/pnl", async (req, res) => {
       best:        Math.round(toSol(best)  * 10000) / 10000,
       worst:       Math.round(toSol(worst) * 10000) / 10000,
       totalUsd:    Math.round(total * 100) / 100,
+      costsUsd:    pnlSummary.costsUsd,
+      aiCostUsd:   pnlSummary.aiCostUsd,
+      txCostUsd:   pnlSummary.txCostUsd,
       tradingDays: values.filter((v) => v !== 0).length,
       open:        pnlSummary.open,
       lockedSol:   pnlSummary.locked,

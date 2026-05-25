@@ -1111,6 +1111,36 @@ Blacklisted tokens are filtered BEFORE the LLM even sees pool candidates.`,
       }
     }
   },
+  {
+    type: "function",
+    function: {
+      name: "close_all_positions",
+      description: `Emergency flatten: close ALL open positions immediately.
+Use ONLY for:
+- Portfolio-wide emergency (extreme market event, system malfunction, operator panic)
+- Deliberate full exit from all active LP positions
+
+Each position is closed in sequence (claim fees then withdraw liquidity).
+Positions that fail individually are skipped — partial flatten is possible.
+Returns a summary of closed vs failed positions.
+
+WARNING: This executes multiple real on-chain transactions. Cannot be undone.`,
+      parameters: {
+        type: "object",
+        properties: {
+          reason: {
+            type: "string",
+            description: "Why all positions are being closed. Required — e.g. 'emergency market event', 'manual operator flatten'."
+          },
+          skip_swap: {
+            type: "boolean",
+            description: "Set to true to skip auto-swap of base tokens back to SOL for all positions. Default: false."
+          }
+        },
+        required: ["reason"]
+      }
+    }
+  },
 ];
 
 export const tools = toolDefinitions.map((tool) => ({
