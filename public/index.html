@@ -540,6 +540,41 @@
       border: 1px solid var(--red-b)
     }
 
+    .tag-open {
+      background: rgba(34, 208, 122, .1);
+      color: var(--green);
+      border: 1px solid rgba(34, 208, 122, .22)
+    }
+
+    .tag-dry {
+      background: rgba(255, 209, 102, .08);
+      color: var(--yellow);
+      border: 1px solid rgba(255, 209, 102, .22)
+    }
+
+    .table-scroll {
+      overflow-x: auto
+    }
+
+    .mono {
+      font-family: var(--mono)
+    }
+
+    .num-pos {
+      color: var(--green);
+      font-weight: 700
+    }
+
+    .num-neg {
+      color: var(--red);
+      font-weight: 700
+    }
+
+    .num-flat {
+      color: var(--muted);
+      font-weight: 600
+    }
+
     .sec-sep {
       padding: 8px 12px;
       font-family: var(--mono);
@@ -806,6 +841,40 @@
       display: none
     }
 
+    .budget-alert {
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      background: rgba(255, 209, 102, .08);
+      border: 1px solid rgba(255, 209, 102, .24);
+      border-radius: 10px;
+      padding: 12px 14px;
+      margin-bottom: 16px;
+      color: var(--yellow);
+      display: none
+    }
+
+    .budget-alert.danger {
+      background: var(--red-bg);
+      border-color: var(--red-b);
+      color: var(--red)
+    }
+
+    .budget-alert strong {
+      font-family: var(--mono);
+      font-size: 12px;
+      letter-spacing: .06em;
+      text-transform: uppercase;
+      white-space: nowrap
+    }
+
+    .budget-alert span {
+      color: var(--text);
+      font-size: 12px;
+      line-height: 1.4;
+      text-align: right
+    }
+
     @media(max-width:900px) {
       .sidebar {
         display: none
@@ -828,6 +897,15 @@
 
       .cycle-row {
         grid-template-columns: 1fr 1fr
+      }
+
+      .budget-alert {
+        align-items: flex-start;
+        flex-direction: column
+      }
+
+      .budget-alert span {
+        text-align: left
       }
     }
   </style>
@@ -863,6 +941,20 @@
             <path d="M16 2v4M8 2v4M3 10h18" stroke-width="1.5" />
           </svg>
           PnL Calendar
+        </a>
+        <a class="nav-item" onclick="go('history',this)">
+          <svg class="nav-icon" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path d="M3 5h18M3 12h18M3 19h18" stroke-width="1.5" />
+            <path d="M7 5v14" stroke-width="1.5" />
+          </svg>
+          Trade History
+        </a>
+        <a class="nav-item" onclick="go('ranking',this)">
+          <svg class="nav-icon" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path d="M4 19V5M4 19h16" stroke-width="1.5" />
+            <path d="M8 15l3-3 3 2 5-7" stroke-width="1.5" />
+          </svg>
+          Ranking
         </a>
         <a class="nav-item" onclick="go('pools',this)">
           <svg class="nav-icon" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -905,6 +997,7 @@
           </div>
         </div>
         <div id="errBox" class="err-box"></div>
+        <div id="aiBudgetAlert" class="budget-alert"></div>
         <div class="stats-grid">
           <div class="stat-card">
             <div class="stat-label">SOL Balance</div>
@@ -1062,6 +1155,81 @@
         </div>
       </div>
 
+      <!-- RANKING -->
+      <div id="page-ranking" class="page">
+        <div class="page-header">
+          <div>
+            <div class="page-title">Wallet Ranking</div>
+            <div class="page-sub">Advanced intelligent LP ranking engine</div>
+          </div>
+          <button class="btn" onclick="loadRanking()">↻ Refresh</button>
+        </div>
+        <div class="card">
+          <div class="card-header"><span class="card-title">Top Wallets</span><span
+              style="font-size:11px;color:var(--muted)" id="rankCnt">—</span></div>
+          <div class="table-scroll">
+            <table class="pool-table">
+              <thead>
+                <tr>
+                  <th>#</th>
+                  <th>Wallet</th>
+                  <th>Score</th>
+                  <th>Grade</th>
+                  <th>7D PnL</th>
+                  <th>30D PnL</th>
+                  <th>Fees</th>
+                  <th>Win Rate</th>
+                </tr>
+              </thead>
+              <tbody id="rankBody">
+                <tr>
+                  <td colspan="8" style="text-align:center;color:var(--muted);padding:32px;font-size:12px">Loading...
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
+      <!-- HISTORY -->
+      <div id="page-history" class="page">
+        <div class="page-header">
+          <div>
+            <div class="page-title">Trade History</div>
+            <div class="page-sub">Pools that have been deployed</div>
+          </div>
+          <button class="btn" onclick="loadPnl()">↻ Refresh</button>
+        </div>
+        <div class="card">
+          <div class="card-header"><span class="card-title">Pool Deployments</span><span
+              style="font-size:11px;color:var(--muted)" id="tradeCnt">—</span></div>
+          <div class="table-scroll">
+            <table class="pool-table">
+              <thead>
+                <tr>
+                  <th>#</th>
+                  <th>Pool</th>
+                  <th>Status</th>
+                  <th>Amount</th>
+                  <th>Strategy</th>
+                  <th>PnL</th>
+                  <th>Reason</th>
+                  <th>Duration</th>
+                  <th>Time</th>
+                </tr>
+              </thead>
+              <tbody id="tradeBody">
+                <tr>
+                  <td colspan="9" style="text-align:center;color:var(--muted);padding:32px;font-size:12px">Loading...
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
       <!-- POOLS -->
       <div id="page-pools" class="page">
         <div class="page-header">
@@ -1123,11 +1291,30 @@
     // const API=(location.hostname==='localhost'||location.hostname==='127.0.0.1')?'http://localhost:3001':'';
     const API = '';
     let CAL = { year: new Date().getFullYear(), month: new Date().getMonth() };
-    let PNL = {}, startTime = null, mMs = 10 * 60 * 1000, sMs = 30 * 60 * 1000;
+    let PNL = {}, TRADES = [], startTime = null, mMs = 10 * 60 * 1000, sMs = 30 * 60 * 1000;
 
     async function get(ep) { const r = await fetch(API + ep); if (!r.ok) throw new Error(r.status); return r.json(); }
     function x(s) { return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
     function showErr(m) { const b = document.getElementById('errBox'); if (!b) return; b.textContent = '⚠ ' + m; b.style.display = 'block'; setTimeout(() => b.style.display = 'none', 6000); }
+
+    function renderAIBudgetAlert(ai) {
+      const el = document.getElementById('aiBudgetAlert');
+      if (!el) return;
+      if (!ai || !ai.warn) {
+        el.style.display = 'none';
+        return;
+      }
+      const dailyLimit = Number(ai.dailyBudgetUsd || 0);
+      const callLimit = Number(ai.maxCallsPerDay || 0);
+      const dailyCost = '$' + Number(ai.dayCostUsd || 0).toFixed(4);
+      const dailyText = dailyLimit > 0 ? dailyCost + ' / $' + dailyLimit : dailyCost;
+      const callText = callLimit > 0 ? (ai.dayCalls || 0) + ' / ' + callLimit + ' calls' : (ai.dayCalls || 0) + ' calls';
+      const pctText = ai.dailyCostPct != null ? ' · daily ' + Number(ai.dailyCostPct).toFixed(1) + '%' : '';
+      el.className = 'budget-alert' + (ai.blocked ? ' danger' : '');
+      el.innerHTML = '<strong>' + (ai.blocked ? 'AI budget blocked' : 'AI budget warning') + '</strong>' +
+        '<span>' + x(ai.reason || 'AI budget is near limit') + ' · ' + x(dailyText) + ' · ' + x(callText + pctText) + '</span>';
+      el.style.display = 'flex';
+    }
 
     function go(n, el) {
       document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
@@ -1135,6 +1322,8 @@
       document.querySelectorAll('.nav-item').forEach(e => e.classList.remove('active'));
       if (el) el.classList.add('active');
       if (n === 'calendar') { loadPnl().then(() => renderCal()); }
+      if (n === 'ranking') loadRanking();
+      if (n === 'history') loadPnl();
       if (n === 'logs') loadLogs();
       if (n === 'pools') loadPools();
     }
@@ -1143,6 +1332,7 @@
       try {
         const d = await get('/api/status');
         const b = d.bot || {}, w = d.wallet || {};
+        renderAIBudgetAlert(d.aiBudget);
         document.getElementById('sDot').className = 'status-dot' + (b.running ? ' live' : ' offline');
         document.getElementById('sTxt').textContent = b.running ? 'Bot running' : 'Bot offline';
         document.getElementById('sMode').textContent = b.mode || '—';
@@ -1195,6 +1385,7 @@
       try {
         const d = await get('/api/pnl');
         PNL = d.daily || {};
+        TRADES = d.trades || [];
         const s = d.summary || {}, p = s.total || 0;
         const pu = s.totalUsd || 0;
         const ps = (p >= 0 ? '+' : '-') + Math.abs(p).toFixed(4) + ' SOL';
@@ -1208,7 +1399,102 @@
         document.getElementById('mBest').textContent = '+' + (s.best || 0).toFixed(4) + ' SOL';
         document.getElementById('mWorst').textContent = '-' + Math.abs(s.worst || 0).toFixed(4) + ' SOL';
         document.getElementById('mDays').textContent = s.tradingDays || 0;
+        renderTrades(d.tradeTotal || TRADES.length);
       } catch (e) { }
+    }
+
+    function fmtSol(v) {
+      const n = Number(v);
+      return Number.isFinite(n) ? n.toFixed(4) + ' SOL' : '—';
+    }
+
+    function fmtPct(v) {
+      const n = Number(v);
+      if (!Number.isFinite(n)) return '—';
+      return (n >= 0 ? '+' : '') + n.toFixed(2) + '%';
+    }
+
+    function fmtDuration(mins) {
+      const n = Number(mins);
+      if (!Number.isFinite(n)) return '—';
+      if (n < 60) return Math.max(0, Math.floor(n)) + 'm';
+      const h = Math.floor(n / 60), m = Math.floor(n % 60);
+      return h + 'h' + (m ? ' ' + m + 'm' : '');
+    }
+
+    function fmtDateTime(v) {
+      if (!v) return '—';
+      const d = new Date(v);
+      if (!Number.isFinite(d.getTime())) return '—';
+      return d.toLocaleString('id-ID', { hour12: false, month: 'short', day: '2-digit', hour: '2-digit', minute: '2-digit' });
+    }
+
+    function renderTrades(total) {
+      const tb = document.getElementById('tradeBody');
+      if (!tb) return;
+      const cnt = document.getElementById('tradeCnt');
+      if (cnt) cnt.textContent = (total || TRADES.length || 0) + ' deploys';
+      if (!TRADES.length) {
+        tb.innerHTML = '<tr><td colspan="9" style="text-align:center;color:var(--muted);padding:32px;font-size:12px">No deployments recorded yet</td></tr>';
+        return;
+      }
+      tb.innerHTML = TRADES.map((t, i) => {
+        const pnl = Number(t.pnlSol);
+        const pct = Number(t.pnlPct);
+        const pnlCls = Number.isFinite(pnl) ? (pnl > 0 ? 'num-pos' : pnl < 0 ? 'num-neg' : 'num-flat') : 'num-flat';
+        const status = String(t.status || '').toLowerCase();
+        const tagCls = status === 'open' ? 'tag-open' : status === 'closed' ? 'tag-c' : 'tag-d';
+        const addr = t.poolAddress ? `<div class="pool-sub">${x(String(t.poolAddress).slice(0, 8))}...${x(String(t.poolAddress).slice(-6))}</div>` : '';
+        const bins = t.lowerBin != null && t.upperBin != null ? `<div class="pool-sub">bins ${x(t.lowerBin)} → ${x(t.upperBin)}</div>` : '';
+        const reason = t.reason ? x(t.reason) : '—';
+        return `<tr>
+          <td class="mono" style="color:var(--muted2);font-size:11px">${i + 1}</td>
+          <td><div class="pool-name">${x(t.pool || 'Unknown')}</div>${addr}${bins}</td>
+          <td><span class="tag ${tagCls}">${x(status || 'unknown')}</span><div style="margin-top:5px"><span class="tag tag-dry">${x(t.mode || 'DRY RUN')}</span></div></td>
+          <td class="mono">${fmtSol(t.amountSol)}</td>
+          <td class="mono">${x(t.strategy || '—')}</td>
+          <td class="mono ${pnlCls}">${fmtSol(t.pnlSol)}<div style="font-size:10px;margin-top:2px">${fmtPct(pct)}</div></td>
+          <td>${reason}</td>
+          <td class="mono">${fmtDuration(t.minutesHeld)}</td>
+          <td class="mono" style="color:var(--muted)">${fmtDateTime(t.closeTime || t.deployTime)}</td>
+        </tr>`;
+      }).join('');
+    }
+
+    async function loadRanking() {
+      try {
+        const d = await get('/api/ranking');
+        const body = document.getElementById('rankBody');
+        const cnt = document.getElementById('rankCnt');
+        const entries = d.latest?.entries || [];
+        if (cnt) {
+          const when = d.latest?.ts ? new Date(d.latest.ts).toLocaleTimeString('id-ID', { hour12: false }) : 'never';
+          cnt.textContent = entries.length + ' ranked | tracked ' + (d.walletsTracked || 0) + ' | ' + when;
+        }
+        if (!entries.length) {
+          body.innerHTML = '<tr><td colspan="8" style="text-align:center;color:var(--muted);padding:32px;font-size:12px">No ranking snapshot yet</td></tr>';
+          return;
+        }
+        body.innerHTML = entries.map((w) => {
+          const score = Number(w.score || 0);
+          const scoreCls = score >= 70 ? 'num-pos' : score >= 45 ? 'num-flat' : 'num-neg';
+          const short = w.address ? String(w.address).slice(0, 8) + '...' + String(w.address).slice(-6) : '—';
+          const wr = Number(w.winRate);
+          return `<tr>
+            <td class="mono" style="color:var(--muted2);font-size:11px">${w.rank || '—'}</td>
+            <td><div class="pool-name">${x(w.label || short)}</div><div class="pool-sub">${x(short)}</div></td>
+            <td class="mono ${scoreCls}">${score.toFixed(0)}</td>
+            <td><span class="tag ${score >= 70 ? 'tag-open' : 'tag-c'}">${x(w.grade || '—')}</span></td>
+            <td class="mono">${Number(w.pnl7d || 0).toFixed(2)}</td>
+            <td class="mono">${Number(w.pnl30d || 0).toFixed(2)}</td>
+            <td class="mono">${Number(w.feesEarned || 0).toFixed(2)}</td>
+            <td class="mono">${Number.isFinite(wr) ? wr.toFixed(1) + '%' : '—'}</td>
+          </tr>`;
+        }).join('');
+      } catch (e) {
+        const body = document.getElementById('rankBody');
+        if (body) body.innerHTML = '<tr><td colspan="8" style="text-align:center;color:var(--red);padding:32px;font-size:12px">Error loading ranking</td></tr>';
+      }
     }
 
     async function loadPools() {
@@ -1318,7 +1604,7 @@
       if (startTime) document.getElementById('uptime').textContent = fmtU(Date.now() - startTime);
     }, 1000);
 
-    async function loadAll() { await Promise.all([loadStatus(), loadPnl(), loadPools()]); }
+    async function loadAll() { await Promise.all([loadStatus(), loadPnl(), loadPools(), loadRanking()]); }
     loadAll();
     setInterval(loadAll, 30000);
   </script>

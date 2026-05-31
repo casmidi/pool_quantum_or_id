@@ -20,13 +20,12 @@ import {
   sendHTML,
   editMessageWithButtons,
   answerCallbackQuery,
-  notifyOutOfRange,
   isEnabled as telegramEnabled,
   createLiveMessage,
   handleApprovalCallback,
 } from "./telegram.js";
 import { generateBriefing } from "./briefing.js";
-import { getLastBriefingDate, setLastBriefingDate, getTrackedPosition, setPositionInstruction, updatePnlAndCheckExits, queuePeakConfirmation, resolvePendingPeak, queueTrailingDropConfirmation, resolvePendingTrailingDrop } from "./state.js";
+import { getLastBriefingDate, setLastBriefingDate, getTrackedPosition, setPositionInstruction, updatePnlAndCheckExits, queuePeakConfirmation, resolvePendingPeak, queueTrailingDropConfirmation, resolvePendingTrailingDrop, touchState } from "./state.js";
 import { getActiveStrategy } from "./strategy-library.js";
 import { recordPositionSnapshot, recallForPool, addPoolNote } from "./pool-memory.js";
 import { checkSmartWalletsOnPool } from "./smart-wallets.js";
@@ -36,6 +35,10 @@ import { getSummary, formatSummaryTelegram, resetBalance, simulateDryRunCloses, 
 import { getWeightsSummary } from "./signal-weights.js";
 import { bootstrapHiveMind, ensureAgentId, getHiveMindPullMode, isHiveMindEnabled, pullHiveMindLessons, pullHiveMindPresets, registerHiveMindAgent, startHiveMindBackgroundSync } from "./hivemind.js";
 import { appendDecision } from "./decision-log.js";
+import { runRankingCycle, scoreWalletShort } from "./ranking/top-performers.js";
+import { rankWalletsAdvanced, scoreWalletAdvanced } from "./scoring/composite-scorer.js";
+import { selectTopWallets, formatSelection } from "./scoring/dynamic-selection.js";
+import { getWeightProfile, getAvailableModes } from "./scoring/weight-profiles.js";
 
 const entrypointPath = process.env.pm_exec_path || process.argv[1];
 const isMain = entrypointPath
@@ -183,6 +186,50 @@ function stripThink(text) {
   return text.replace(/<think>[\s\S]*?<\/think>/gi, "").trim();
 }
 
+function isDeployTelegramReport(text) {
+  const clean = stripThink(String(text || "")).trim();
+  return /^DRY RUN - NO REAL DEPLOY\b/i.test(clean) || /^🚀\s*DEPLOYED\b/i.test(clean);
+}
+
+function formatDeployAttemptReport({ result, success }) {
+  const deployResult = result?.result ?? result ?? {};
+  const would = deployResult?.would_deploy ?? {};
+  const pool = would.pool_name || deployResult.pool_name || deployResult.pool || would.pool_address || deployResult.pool_address;
+  const address = would.pool_address || deployResult.pool_address;
+  const amount = would.amount_y ?? deployResult.amount_y ?? deployResult.amount_sol ?? deployResult.amount;
+  const strategy = would.strategy || deployResult.strategy;
+  const reason = deployResult.reason || deployResult.error || result?.reason || result?.error || deployResult.message;
+  const isDryRunDeploy = Boolean(
+    deployResult?.dry_run ||
+    deployResult?.would_deploy ||
+    String(deployResult?.message ?? "").toUpperCase().includes("DRY RUN")
+  );
+
+  if (isDryRunDeploy) {
+    return [
+      "DRY RUN - NO REAL DEPLOY",
+      "",
+      pool ? `Pool: ${pool}` : null,
+      address && address !== pool ? `Address: ${address}` : null,
+      amount != null ? `Amount: ${amount} SOL` : null,
+      strategy ? `Strategy: ${strategy}` : null,
+      "No on-chain transaction was sent because DRY_RUN is enabled.",
+    ].filter(Boolean).join("\n");
+  }
+
+  if (success && !deployResult?.blocked && !deployResult?.error) return null;
+
+  return [
+    "DEPLOY FAILED",
+    "",
+    pool ? `Pool: ${pool}` : null,
+    address && address !== pool ? `Address: ${address}` : null,
+    amount != null ? `Amount: ${amount} SOL` : null,
+    strategy ? `Strategy: ${strategy}` : null,
+    reason ? `Reason: ${reason}` : "Reason: deploy_position did not complete successfully",
+  ].filter(Boolean).join("\n");
+}
+
 function sanitizeUntrustedPromptText(text, maxLen = 500) {
   if (!text) return null;
   const cleaned = String(text)
@@ -216,6 +263,31 @@ function parseHybridReview(content) {
       reason: raw.slice(0, 400) || "Claude review returned an unreadable response",
     };
   }
+}
+
+function enrichDeployArgsFromCandidate(args, candidate) {
+  const pool = candidate?.pool;
+  if (!args || !pool) return args;
+
+  const enriched = {
+    ...args,
+    pool_name: args.pool_name ?? pool.name,
+    base_mint: args.base_mint ?? pool.base?.mint ?? pool.base_mint,
+    bin_step: args.bin_step ?? pool.bin_step,
+    base_fee: args.base_fee ?? pool.base_fee ?? pool.fee_pct,
+    volatility: args.volatility ?? pool.volatility,
+    fee_tvl_ratio: args.fee_tvl_ratio ?? pool.fee_active_tvl_ratio ?? pool.fee_tvl_ratio,
+    tvl: args.tvl ?? pool.tvl ?? pool.active_tvl,
+    active_pct: args.active_pct ?? pool.active_pct,
+    organic_score: args.organic_score ?? pool.organic_score,
+    initial_value_usd: args.initial_value_usd ?? pool.tvl ?? pool.active_tvl,
+    screened_at: args.screened_at ?? pool.screened_at ?? pool.data_fetched_at ?? new Date().toISOString(),
+  };
+
+  for (const [key, value] of Object.entries(enriched)) {
+    if (value !== undefined && value !== null) args[key] = value;
+  }
+  return args;
 }
 
 async function reviewDeployWithHybridAI({ pool, candidateBlock, deployArgs, deployAmount, strategyBlock }) {
@@ -368,9 +440,6 @@ export async function runManagementCycle({ silent = false } = {}) {
   const screeningCooldownMs = 5 * 60 * 1000;
 
   try {
-    if (!silent && telegramEnabled()) {
-      liveMessage = await createLiveMessage("🔄 Management Cycle", "Evaluating positions...");
-    }
     if (isDryRunMode()) {
       const closed = await simulateDryRunCloses({});
       const sim = getSummary();
@@ -425,7 +494,6 @@ export async function runManagementCycle({ silent = false } = {}) {
           const failed = flatResult?.failed_count ?? 0;
           mgmtReport = `[AUTO-FLATTEN] Portfolio heat ${flattenHeat} triggered emergency close. Closed ${closed}/${positions.length} positions${failed > 0 ? `, ${failed} failed` : ""}.`;
           log("cron", mgmtReport);
-          if (telegramEnabled()) sendMessage(mgmtReport).catch(() => {});
           return mgmtReport;
         } catch (e) {
           log("cron_error", `Auto-flatten failed: ${e.message}`);
@@ -575,17 +643,6 @@ After executing, write a brief one-line result per position.
     mgmtReport = `Management cycle failed: ${error.message}`;
   } finally {
     _managementBusy = false;
-    if (!silent && telegramEnabled()) {
-      if (mgmtReport) {
-        if (liveMessage) await liveMessage.finalize(stripThink(mgmtReport)).catch(() => {});
-        else sendMessage(`🔄 Management Cycle\n\n${stripThink(mgmtReport)}`).catch(() => { });
-      }
-      for (const p of positions) {
-        if (!p.in_range && p.minutes_out_of_range >= config.management.outOfRangeWaitMinutes) {
-          notifyOutOfRange({ pair: p.pair, minutesOOR: p.minutes_out_of_range }).catch(() => { });
-        }
-      }
-    }
   }
   return mgmtReport;
 }
@@ -650,9 +707,6 @@ export async function runScreeningCycle({ silent = false } = {}) {
     _screeningBusy = false;
     return screenReport;
   }
-  if (!silent && telegramEnabled()) {
-    liveMessage = await createLiveMessage("🔍 Screening Cycle", "Scanning candidates...");
-  }
   timers.screeningLastRun = Date.now();
   log("cron", `Starting screening cycle [model: ${config.llm.screeningModel}]`);
   try {
@@ -714,7 +768,21 @@ export async function runScreeningCycle({ silent = false } = {}) {
       return true;
     });
 
+    // setLatestCandidates(passing.map(p => p.pool));
+    setLatestCandidates([
+      ...passing.map(p => ({
+        ...p.pool,
+        status: "candidate"
+      })),
+      ...filteredOut.map(f => ({
+        name: f.name,
+        reason: f.reason,
+        status: "dropped"
+      }))
+    ]);
+
     if (passing.length === 0) {
+
       const combined = filteredOut.length > 0 ? filteredOut : earlyFilteredExamples;
       const combinedExamples = combined.slice(0, 3)
         .map((entry) => `- ${entry.name}: ${entry.reason}`)
@@ -776,6 +844,7 @@ export async function runScreeningCycle({ silent = false } = {}) {
       const priceChange = ti?.stats_1h?.price_change;
       const netBuyers = ti?.stats_1h?.net_buyers;
       const activeBin = activeBinResults[i]?.status === "fulfilled" ? activeBinResults[i].value?.binId : null;
+      const dlmmPlan = pool.dlmm_plan;
 
       // OKX signals
       const okxParts = [
@@ -794,7 +863,7 @@ export async function runScreeningCycle({ silent = false } = {}) {
         pool.kol_in_clusters    ? "kol_in_clusters"    : null,
         pool.dex_boost          ? "dex_boost"          : null,
         pool.dex_screener_paid  ? "dex_screener_paid"  : null,
-        pool.dev_sold_all       ? "dev_sold_all(bullish)" : null,
+        pool.dev_sold_all       ? "dev_sold_all(risk)" : null,
       ].filter(Boolean).join(", ");
       const pvpLine = pool.is_pvp
         ? `  pvp: HIGH — rival ${pool.pvp_rival_name || pool.pvp_symbol} (${pool.pvp_rival_mint?.slice(0, 8)}...) has pool ${pool.pvp_rival_pool?.slice(0, 8)}..., tvl=$${pool.pvp_rival_tvl}, holders=${pool.pvp_rival_holders}, fees=${pool.pvp_rival_fees}SOL`
@@ -810,6 +879,7 @@ export async function runScreeningCycle({ silent = false } = {}) {
         pool.price_vs_ath_pct != null ? `  ath: price_vs_ath=${pool.price_vs_ath_pct}%${pool.top_cluster_trend ? `, top_cluster=${pool.top_cluster_trend}` : ""}` : null,
         `  smart_wallets: ${sw?.in_pool?.length ?? 0} present${sw?.in_pool?.length ? ` → CONFIDENCE BOOST (${sw.in_pool.map(w => w.name).join(", ")})` : ""}`,
         activeBin != null ? `  active_bin: ${activeBin}` : null,
+        dlmmPlan ? `  dlmm_plan: strategy=${dlmmPlan.strategy}, regime=${dlmmPlan.regime}, bins_below=${dlmmPlan.bins_below}, bins_above=${dlmmPlan.bins_above}, projected_net_ev=${dlmmPlan.projected?.net_ev_pct}%/day${dlmmPlan.warnings?.length ? `, warnings=${dlmmPlan.warnings.join("; ")}` : ""}` : null,
         priceChange != null ? `  1h: price${priceChange >= 0 ? "+" : ""}${priceChange}%, net_buyers=${netBuyers ?? "?"}` : null,
         n?.narrative ? `  narrative_untrusted: ${sanitizeUntrustedPromptText(n.narrative, 500)}` : `  narrative_untrusted: none`,
         mem ? `  memory_untrusted: ${sanitizeUntrustedPromptText(mem, 500)}` : null,
@@ -842,6 +912,7 @@ export async function runScreeningCycle({ silent = false } = {}) {
     let deployAttempted = false;
     let deploySucceeded = false;
     let lastDeployOutcome = null;
+    let deployTelegramReport = null;
     const { content } = await agentLoop(`
 SCREENING CYCLE
 ${strategyBlock}
@@ -854,8 +925,10 @@ STEPS:
 1. Decide if any candidate is actually worth deploying. One surviving candidate is not automatically good enough.
 2. Pick the best candidate based on narrative quality, smart wallets, and pool metrics.
 3. Call deploy_position (active_bin is pre-fetched above — no need to call get_active_bin).
-   bins_below = round(${config.strategy.minBinsBelow} + (candidate volatility/5)*(${config.strategy.maxBinsBelow - config.strategy.minBinsBelow})) clamped to [${config.strategy.minBinsBelow},${config.strategy.maxBinsBelow}].
+   Prefer the candidate dlmm_plan when present: strategy=dlmm_plan.strategy, bins_below=dlmm_plan.bins_below, bins_above=0.
+   If dlmm_plan is missing, fallback to bins_below = round(${config.strategy.minBinsBelow} + (candidate volatility/5)*(${config.strategy.maxBinsBelow - config.strategy.minBinsBelow})) clamped to [${config.strategy.minBinsBelow},${config.strategy.maxBinsBelow}].
    pass deploy_position.volatility = the candidate volatility value.
+   Include the candidate's bin_step, base_fee/fee_pct, fee_tvl_ratio, tvl, organic_score, active_pct, and base_mint in the deploy_position args.
    For single-side SOL deploys, do not invent upside:
    set amount_y only, keep amount_x = 0, keep bins_above = 0, and let the upper bin stay at the active bin.
 4. Report in this exact format (no tables, no extra sections):
@@ -922,7 +995,6 @@ IMPORTANT:
         },
         beforeToolCall: async ({ name, args }) => {
           if (name !== "deploy_position") return { allowed: true };
-          if (!config.llm.hybridReviewEnabled) return { allowed: true };
 
           const poolAddress = args?.pool_address;
           const candidate = candidateByPool.get(poolAddress);
@@ -932,6 +1004,9 @@ IMPORTANT:
               reason: `Hybrid review blocked deploy: ${poolAddress || "unknown pool"} was not in the pre-scored candidate set`,
             };
           }
+          enrichDeployArgsFromCandidate(args, candidate);
+
+          if (!config.llm.hybridReviewEnabled) return { allowed: true };
 
           const maxReviews = Number(config.llm.reviewMaxPerCycle ?? 1);
           if (Number.isFinite(maxReviews) && maxReviews > 0 && hybridReviewsThisCycle >= maxReviews) {
@@ -969,6 +1044,7 @@ IMPORTANT:
               !deployResult?.blocked &&
               !isDryRunDeploy
             );
+            deployTelegramReport = formatDeployAttemptReport({ result, success });
           }
           await liveMessage?.toolFinish(name, result, success);
         },
@@ -980,7 +1056,9 @@ IMPORTANT:
         lastDeployOutcome?.would_deploy ||
         String(lastDeployOutcome?.message ?? "").toUpperCase().includes("DRY RUN")
       );
-      if (isDryRunDeploy) {
+      if (deployTelegramReport) {
+        screenReport = deployTelegramReport;
+      } else if (isDryRunDeploy) {
         const would = lastDeployOutcome?.would_deploy ?? {};
         screenReport = [
           "DRY RUN - NO REAL DEPLOY",
@@ -1011,12 +1089,22 @@ IMPORTANT:
     log("cron_error", `Screening cycle failed: ${error.message}`);
     screenReport = `Screening cycle failed: ${error.message}`;
   } finally {
+      try {
+        const reportText = String(screenReport || "");
+        const hasCandidates = Boolean(reportText) &&
+          !/^No candidates available/i.test(reportText) &&
+          !/^Screening skipped/i.test(reportText);
+        touchState({
+          screeningComplete: true,
+          hasCandidates,
+          report: reportText.slice(0, 200),
+        });
+      } catch (err) {
+        log("state_error", `Failed to touch dashboard state: ${err.message}`);
+      }    
     _screeningBusy = false;
-    if (!silent && telegramEnabled()) {
-      if (screenReport) {
-        if (liveMessage) await liveMessage.finalize(stripThink(screenReport)).catch(() => {});
-        else sendMessage(`🔍 Screening Cycle\n\n${stripThink(screenReport)}`).catch(() => { });
-      }
+    if (!silent && telegramEnabled() && isDeployTelegramReport(screenReport)) {
+      sendMessage(stripThink(screenReport)).catch(() => { });
     }
   }
   return screenReport;
@@ -1063,6 +1151,18 @@ Summarize the current portfolio health, total fees earned, and performance of al
   const briefingWatchdog = cron.schedule(`0 */6 * * *`, async () => {
     await maybeRunMissedBriefing();
   }, { timezone: 'UTC' });
+
+  // Every 6h on the half-hour — auto-rank wallets
+  const rankingTask = cron.schedule(`30 */6 * * *`, async () => {
+    if (_managementBusy || _screeningBusy) return;
+    log("cron", "Starting ranking cycle");
+    try {
+      await runRankingCycle();
+      log("cron", "Ranking cycle complete");
+    } catch (error) {
+      log("cron_error", `Ranking cycle failed: ${error.message}`);
+    }
+  });
 
   // Lightweight 30s PnL poller — updates trailing TP state between management cycles, no LLM
   let _pnlPollBusy = false;
@@ -1126,7 +1226,7 @@ Summarize the current portfolio health, total fees earned, and performance of al
     }
   }, 30_000);
 
-  _cronTasks = [mgmtTask, screenTask, healthTask, briefingTask, briefingWatchdog];
+  _cronTasks = [mgmtTask, screenTask, healthTask, briefingTask, briefingWatchdog, rankingTask];
   // Store interval ref so stopCronJobs can clear it
   _cronTasks._pnlPollInterval = pnlPollInterval;
   log("cron", `Cycles started — management every ${config.schedule.managementIntervalMin}m, screening every ${config.schedule.screeningIntervalMin}m`);
@@ -1229,8 +1329,23 @@ function getDeterministicCloseRule(position, managementConfig) {
   }
   if (
     position.active_bin != null &&
+    position.lower_bin != null &&
+    position.active_bin < position.lower_bin - managementConfig.outOfRangeBinsToClose
+  ) {
+    return { action: "CLOSE", rule: 3, reason: "dumped far below range" };
+  }
+  if (
+    position.active_bin != null &&
     position.upper_bin != null &&
     position.active_bin > position.upper_bin &&
+    (position.minutes_out_of_range ?? 0) >= managementConfig.outOfRangeWaitMinutes
+  ) {
+    return { action: "CLOSE", rule: 4, reason: "OOR" };
+  }
+  if (
+    position.active_bin != null &&
+    position.lower_bin != null &&
+    position.active_bin < position.lower_bin &&
     (position.minutes_out_of_range ?? 0) >= managementConfig.outOfRangeWaitMinutes
   ) {
     return { action: "CLOSE", rule: 4, reason: "OOR" };
@@ -1590,6 +1705,10 @@ function formatHelpText() {
     "/candidates — show latest cached candidates",
     "/deploy <n> — deploy candidate by cached index",
     "/briefing — morning briefing",
+    "/rank — run ranking cycle and show top wallets",
+    "/rank [mode] — run with mode (conservative|balanced|aggressive|momentum)",
+    "/rank-score <wallet> — score individual wallet in detail",
+    "/rank-modes — list available ranking strategy modes",
     "/hive — HiveMind sync status",
     "/hive pull — manual HiveMind pull now",
     "/pause — stop cron cycles",
@@ -1715,7 +1834,7 @@ async function telegramHandler(msg) {
     return;
   }
   // Commands yang langsung dieksekusi tanpa antri (hanya baca data, tidak ganggu agent)
-  const INSTANT_COMMANDS = ["/summary", "/resetbalance", "/config", "/help"];
+  const INSTANT_COMMANDS = ["/summary", "/resetbalance", "/config", "/help", "/rank", "/rank-score", "/rank-modes"];
   const isInstant = INSTANT_COMMANDS.some(c => text === c || text.startsWith(c + " "));
 
   if (!isInstant && (_managementBusy || _screeningBusy || busy)) {
@@ -1953,6 +2072,99 @@ async function telegramHandler(msg) {
       await sendMessage("▶️ Autonomous cycles resumed.").catch(() => {});
     } else {
       await sendMessage("Autonomous cycles are already running.").catch(() => {});
+    }
+    return;
+  }
+
+  if (text === "/rank" || text.startsWith("/rank ")) {
+    try {
+      const parts = text.split(" ");
+      const mode = parts.length > 1 ? parts[1].toLowerCase() : null;
+      const validModes = ["conservative", "balanced", "aggressive", "momentum", "hybrid"];
+      const useMode = mode && validModes.includes(mode) ? mode : null;
+
+      const result = await runRankingCycle({ mode: useMode || "auto_top_10", count: 10 });
+      const topWallets = (result?.top || []).slice(0, 10);
+      if (!topWallets.length) {
+        // Fallback to advanced scoring if available
+        try {
+          const { rankWalletsAdvanced } = await import("./scoring/composite-scorer.js");
+          const { selectTopWallets } = await import("./scoring/dynamic-selection.js");
+          if (result?.snapshot?.wallets?.length) {
+            const ranked = rankWalletsAdvanced(result.snapshot.wallets, useMode || "balanced");
+            const selection = selectTopWallets(ranked, { topN: 10, mode: useMode || "balanced" });
+            if (selection?.selected?.length) {
+              const lines = selection.selected.map((w, i) => {
+                const label = w.label || w.address?.slice(0, 8);
+                return `${i + 1}. ${label} | score ${w._score ?? "?"} (${w._grade || "?"}) | fees ${w.feesEarned?.toFixed(2) ?? "?"} SOL`;
+              });
+              const modeName = selection.mode || useMode || "auto";
+              await sendMessage(`🏆 Top Wallets (advanced: ${modeName})\n\n${lines.join("\n")}`).catch(() => {});
+              return;
+            }
+          }
+        } catch { /* fallback failed — show original message */ }
+        await sendMessage("Ranking cycle completed but no wallets scored yet.").catch(() => {});
+        return;
+      }
+      const lines = topWallets.map((w, i) => {
+        const label = w.label || w.address?.slice(0, 8);
+        const fees = w.rawData?.feesEarned != null ? `${w.rawData.feesEarned.toFixed(2)} SOL` : "?";
+        const wins = w.rawData?.winRate != null ? `${w.rawData.winRate.toFixed(0)}% WR` : "";
+        return `${i + 1}. ${label} | score ${w.score ?? "?"} (${w.grade || "?"}) | fees ${fees} ${wins}`;
+      });
+      const modeLabel = useMode ? `mode: ${useMode}` : (result?.snapshot?.mode || "auto");
+      await sendMessage(`🏆 Top Wallets (${modeLabel})\n\n${lines.join("\n")}`).catch(() => {});
+    } catch (e) {
+      await sendMessage(`Ranking error: ${e.message}`).catch(() => {});
+    }
+    return;
+  }
+
+  if (text.startsWith("/rank-score ")) {
+    try {
+      const walletAddr = text.replace("/rank-score", "").trim();
+      if (!walletAddr || walletAddr.length < 30) {
+        await sendMessage("Usage: /rank-score <wallet_address>").catch(() => {});
+        return;
+      }
+      // Try advanced scoring first
+      try {
+        const { scoreWalletAdvanced } = await import("./scoring/composite-scorer.js");
+        const { getWeightProfile } = await import("./scoring/weight-profiles.js");
+        const profile = getWeightProfile("balanced");
+        const result = scoreWalletAdvanced({ address: walletAddr, label: walletAddr.slice(0, 8) }, "balanced", profile.thresholds);
+        const lines = [
+          `📊 Wallet Score: ${walletAddr.slice(0, 12)}...${walletAddr.slice(-8)}`,
+          `Overall: ${result.score ?? "?"}/100 (${result.grade || "?"})`,
+          `Mode: balanced | Strategy: ${profile.name}`,
+        ];
+        if (result._breakdown) {
+          for (const [factor, val] of Object.entries(result._breakdown)) {
+            if (typeof val === "number") lines.push(`  ${factor}: ${val.toFixed(1)}`);
+          }
+        }
+        await sendMessage(lines.join("\n")).catch(() => {});
+        return;
+      } catch { /* fallback to simple scorer */ }
+      const result = await scoreWalletShort(walletAddr);
+      await sendMessage(`📊 Wallet Score: ${walletAddr.slice(0, 12)}...${walletAddr.slice(-8)}\nScore: ${result?.score ?? "?"} (${result?.grade || "?"})`).catch(() => {});
+    } catch (e) {
+      await sendMessage(`Score error: ${e.message}`).catch(() => {});
+    }
+    return;
+  }
+
+  if (text === "/rank-modes") {
+    try {
+      const modes = getAvailableModes();
+      const lines = modes.map(m => {
+        const profile = getWeightProfile(m);
+        return `• ${m}: ${profile.description || "No description"}${profile.risk ? ` [risk: ${profile.risk}]` : ""}`;
+      });
+      await sendMessage(`📋 Ranking Strategy Modes\n\n${lines.join("\n")}\n\nUsage: /rank <mode>\nExample: /rank aggressive`).catch(() => {});
+    } catch (e) {
+      await sendMessage(`Modes error: ${e.message}`).catch(() => {});
     }
     return;
   }

@@ -1011,6 +1011,230 @@ Use when you observe something worth remembering about a specific pool:
     }
   },
 
+  // ═══════════════════════════════════════════
+  //  INTELLIGENCE FUSION TOOLS
+  // ═══════════════════════════════════════════
+  {
+    type: "function",
+    function: {
+      name: "fuse_wallet_data",
+      description: `Aggregate wallet data from ALL available data sources (GMGN, Helius, Dune, fallback chain).
+
+Runs providers in parallel, merges data with priority: GMGN > Helius > Dune > Fallback.
+Returns fused PnL, positions, activity metrics, risk profile, and token holdings.
+
+Use this to get the most complete wallet picture possible — combines multiple
+on-chain data APIs into one normalized result.`,
+      parameters: {
+        type: "object",
+        properties: {
+          wallet_address: {
+            type: "string",
+            description: "Solana wallet address (base58) to research"
+          },
+          force_refresh: {
+            type: "boolean",
+            description: "Bypass cache and fetch fresh data (default: false)"
+          }
+        },
+        required: ["wallet_address"]
+      }
+    }
+  },
+
+  {
+    type: "function",
+    function: {
+      name: "fuse_multiple_wallets",
+      description: `Fuse data for multiple wallets in parallel.
+
+Aggregates wallet intelligence from all providers for up to 20 wallets at once.
+More efficient than calling fuse_wallet_data repeatedly for batch research.`,
+      parameters: {
+        type: "object",
+        properties: {
+          wallet_addresses: {
+            type: "array",
+            items: { type: "string" },
+            description: "Array of Solana wallet addresses (base58)"
+          },
+          force_refresh: {
+            type: "boolean",
+            description: "Bypass cache and fetch fresh data"
+          }
+        },
+        required: ["wallet_addresses"]
+      }
+    }
+  },
+
+  {
+    type: "function",
+    function: {
+      name: "get_provider_status",
+      description: `Get the current availability status of all intelligence data providers.
+
+Returns which providers (GMGN, Helius, Dune, Fallback) have working API keys,
+rate limit status, and any recent errors.
+
+Use this to diagnose why certain wallet data might be incomplete.`,
+      parameters: {
+        type: "object",
+        properties: {}
+      }
+    }
+  },
+
+  {
+    type: "function",
+    function: {
+      name: "get_top_performer_candidates",
+      description: `Fetch and fuse top LP performer candidates from multiple sources.
+
+Aggregates wallet addresses from:
+- Tracked smart wallets
+- Dune Analytics LP leaderboard
+- Existing ranking database
+
+Then fuses full intelligence data for each candidate.
+Use this as the data source for wallet selection and copy trading decisions.`,
+      parameters: {
+        type: "object",
+        properties: {
+          count: {
+            type: "number",
+            description: "Number of top candidates to return (default 20)"
+          },
+          force_refresh: {
+            type: "boolean",
+            description: "Bypass cache and fetch fresh data"
+          }
+        }
+      }
+    }
+  },
+
+  // ═══════════════════════════════════════════
+  //  RANKING TOOLS
+  // ═══════════════════════════════════════════
+  {
+    type: "function",
+    function: {
+      name: "run_ranking_cycle",
+      description: `Run the full wallet ranking cycle: fetch scores, rank, and persist results.
+
+Fetches on-chain performance data (Birdeye, LPAgent, GMGN, Helius) for tracked smart wallets,
+scores each wallet on multiple dimensions, ranks them, and saves the results to the ranking database.
+
+Use this to:
+- Get an up-to-date list of top-performing tracked wallets
+- Discover new wallets to watch from signals
+- Refresh the ranking database with fresh scores
+
+Returns the top N ranked wallets with their scores and metadata.`,
+      parameters: {
+        type: "object",
+        properties: {
+          mode: {
+            type: "string",
+            enum: ["auto_top_10", "all"],
+            description: "'auto_top_10' = rank and keep top 10, 'all' = keep all tracked wallets"
+          },
+          count: {
+            type: "number",
+            description: "Number of top wallets to return (default 10)"
+          }
+        }
+      }
+    }
+  },
+
+  {
+    type: "function",
+    function: {
+      name: "score_wallet",
+      description: `Score a single wallet address quickly for a snapshot assessment.
+Fetches the wallet's performance data and returns a score breakdown.
+Use this when the user asks about a specific wallet or wants a quick check.`,
+      parameters: {
+        type: "object",
+        properties: {
+          wallet_address: {
+            type: "string",
+            description: "The Solana wallet address (base58) to score"
+          }
+        },
+        required: ["wallet_address"]
+      }
+    }
+  },
+
+  // ═══════════════════════════════════════════
+  //  ADVANCED SCORING TOOLS (Multi-Layer Scoring Engine)
+  // ═══════════════════════════════════════════
+  {
+    type: "function",
+    function: {
+      name: "score_wallet_advanced",
+      description: `Advanced wallet performance scoring with configurable strategy mode.
+
+Scores a wallet on 6 factor groups (PnL, Risk, Activity, Liquidity, Momentum, Fingerprint)
+using the Multi-Layer Scoring Engine with weighted profiles.
+
+Strategy modes:
+  conservative — Safety-first: prioritizes capital preservation and consistent returns
+  balanced     — Default: even mix of growth and risk management
+  aggressive   — Growth-first: prioritizes PnL, momentum, and high fee generation
+  momentum     — Trend-following: prioritizes recent streaks, hot wallets, PnL trend
+  hybrid       — Adaptive: weights shift based on detected market regime
+
+Returns full factor breakdown with scores, weights, contributions, grade, and risk profile.`,
+      parameters: {
+        type: "object",
+        properties: {
+          wallet_address: { type: "string", description: "Solana wallet address (base58) to score" },
+          mode: {
+            type: "string",
+            enum: ["conservative", "balanced", "aggressive", "momentum", "hybrid"],
+            description: "Scoring strategy mode (default: balanced)"
+          }
+        },
+        required: ["wallet_address"]
+      }
+    }
+  },
+
+  {
+    type: "function",
+    function: {
+      name: "select_top_wallets",
+      description: `Intelligently select the top N wallets from ranking data.
+
+Uses the Dynamic Selection Engine which:
+- Scores all candidate wallets using advanced multi-layer factors
+- Filters by minimum score threshold (excludes poor performers)
+- Enforces whitelist (always include) and blacklist (always exclude)
+- Detects performance decay (auto-exclude declining wallets)
+- Checks pairwise correlation for redundancy detection
+- Sorts by score and returns top N
+
+Strategy modes apply different weight profiles to selection.`,
+      parameters: {
+        type: "object",
+        properties: {
+          count: { type: "number", description: "Number of top wallets to select (default: 10)" },
+          mode: {
+            type: "string",
+            enum: ["conservative", "balanced", "aggressive", "momentum", "hybrid"],
+            description: "Scoring strategy mode (default: balanced)"
+          },
+          min_score: { type: "number", description: "Minimum score threshold to include (default: 20)" },
+          auto_exclude_decaying: { type: "boolean", description: "Auto-exclude wallets with performance decay (default: true)" }
+        }
+      }
+    }
+  },
+
   // ─── Token Blacklist ────────────────────────────────────────────
 
   {

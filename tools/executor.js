@@ -20,7 +20,15 @@ import { addToBlacklist, removeFromBlacklist, listBlacklist } from "../token-bla
 import { blockDev, unblockDev, listBlockedDevs } from "../dev-blocklist.js";
 import { addSmartWallet, removeSmartWallet, listSmartWallets, checkSmartWalletsOnPool } from "../smart-wallets.js";
 import { getTokenInfo, getTokenHolders, getTokenNarrative } from "./token.js";
+import { runRankingCycle, scoreWalletShort } from "../ranking/top-performers.js";
+import { scoreWalletAdvanced, rankWalletsAdvanced } from "../scoring/composite-scorer.js";
+import { selectTopWallets, formatSelection } from "../scoring/dynamic-selection.js";
+import { getWeightProfile, getAvailableModes } from "../scoring/weight-profiles.js";
+import { fuseWalletData, fuseMultipleWallets, getTopPerformerCandidates, getProviderStatus } from "../intelligence/fusion-layer.js";
+import { runAllocation } from "../allocation/allocation-engine.js";
+import { analyzePositionForCopy } from "../decision/analysis-engine.js";
 import { config, reloadScreeningThresholds, MIN_SAFE_BINS_BELOW } from "../config.js";
+import { planDlmmEntry } from "../strategy/dlmm-edge.js";
 import { getRecentDecisions } from "../decision-log.js";
 import fs from "fs";
 import path from "path";
@@ -46,7 +54,7 @@ const TIMEFRAME_MINUTES = {
 };
 import { log, logAction } from "../logger.js";
 import { notifyDeploy, notifyClose, notifySwap, requestApproval, isEnabled as telegramEnabled } from "../telegram.js";
-import { recordDeploy, recordClose, getOpenTrades } from "../lib/pnl_tracker.js";
+import { recordDeploy, recordClose, getOpenTrades, getSummary } from "../lib/pnl_tracker.js";
 
 function numberOrNull(value) {
   const n = Number(value);
@@ -301,6 +309,24 @@ function normalizeConfigValue(key, value) {
 
 // Map tool names to implementations
 const toolMap = {
+  fuse_wallet_data: async ({ wallet_address, force_refresh }) => {
+    if (!wallet_address) return { error: "wallet_address is required" };
+    const result = await fuseWalletData(wallet_address, { forceRefresh: !!force_refresh });
+    return result || { error: "Fusion returned no data" };
+  },
+  fuse_multiple_wallets: async ({ wallet_addresses, force_refresh }) => {
+    if (!wallet_addresses || !Array.isArray(wallet_addresses) || wallet_addresses.length === 0)
+      return { error: "wallet_addresses array is required" };
+    const results = await fuseMultipleWallets(wallet_addresses, { forceRefresh: !!force_refresh });
+    return { wallets: results, count: results.length };
+  },
+  get_provider_status: async () => {
+    return { providers: getProviderStatus(), available: getAvailableModes() };
+  },
+  get_top_performer_candidates: async ({ count, force_refresh }) => {
+    const result = await getTopPerformerCandidates({ count: count || 20, forceRefresh: !!force_refresh });
+    return { candidates: result, count: result.length };
+  },
   discover_pools: discoverPools,
   get_top_candidates: getTopCandidates,
   get_pool_detail: getPoolDetail,
@@ -425,6 +451,48 @@ const toolMap = {
       return { cleared: n, mode: "keyword", keyword };
     }
     return { error: "invalid mode" };
+  },
+  run_ranking_cycle: async ({ mode, count }) => {
+    const result = await runRankingCycle({ mode, count });
+    return result || { message: "Ranking cycle completed but returned no data" };
+  },
+  score_wallet: async ({ wallet_address }) => {
+    if (!wallet_address) return { error: "wallet_address is required" };
+    return await scoreWalletShort(wallet_address);
+  },
+  score_wallet_advanced: async ({ wallet_address, mode }) => {
+    if (!wallet_address) return { error: "wallet_address is required" };
+    const { fetchWalletMetrics } = await import("../ranking/top-performers.js");
+    const metrics = await fetchWalletMetrics(wallet_address);
+    const result = scoreWalletAdvanced(metrics, mode || "balanced");
+    return {
+      address: wallet_address,
+      label: metrics.label || wallet_address.slice(0, 8),
+      ...result,
+      rawMetrics: metrics,
+    };
+  },
+  select_top_wallets: async ({ count, mode, min_score, auto_exclude_decaying }) => {
+    // Run the full ranking cycle and then apply intelligent selection
+    const ranking = await runRankingCycle({ count: Math.max(count || 10, 50), mode });
+    const candidates = (ranking?.top || []).map(w => ({
+      address: w.address,
+      label: w.label || w.address?.slice(0, 8),
+      ...w.rawMetrics,
+      scoreHistory: w.scoreHistory,
+    }));
+    const selection = selectTopWallets(candidates, {
+      topN: count || 10,
+      mode: mode || "balanced",
+      whitelist: config.scoring?.whitelist || [],
+      blacklist: config.scoring?.blacklist || [],
+      minScore: min_score,
+      autoExcludeDecaying: auto_exclude_decaying !== false,
+    });
+    return {
+      ...selection,
+      formatted: formatSelection(selection),
+    };
   },
   update_config: ({ changes, reason = "" }) => {
     // Flat key → config section mapping (covers everything in config.js)
@@ -896,12 +964,27 @@ async function runSafetyChecks(name, args) {
           reason: "This agent only supports single-side SOL deploys. Use amount_y/amount_sol and keep amount_x=0.",
         };
       }
-      const requestedBinsBelow = Number(args.bins_below ?? config.strategy.defaultBinsBelow ?? config.strategy.minBinsBelow);
-      const requestedBinsAbove = Number(args.bins_above ?? 0);
+      let requestedBinsBelow = Number(args.bins_below ?? config.strategy.defaultBinsBelow ?? config.strategy.minBinsBelow);
+      let requestedBinsAbove = Number(args.bins_above ?? 0);
       const minBinsBelow = Math.max(MIN_SAFE_BINS_BELOW, Number(config.strategy.minBinsBelow ?? MIN_SAFE_BINS_BELOW));
       const isSingleSidedSol = deployAmountY > 0 && deployAmountX <= 0;
-      const requestedTotalBins = requestedBinsBelow + requestedBinsAbove;
       const requestedVolatility = args.volatility == null ? null : Number(args.volatility);
+
+      if (isSingleSidedSol && args.bins_below == null && requestedVolatility != null && requestedVolatility > 0) {
+        const plan = planDlmmEntry({
+          fee_active_tvl_ratio: args.fee_tvl_ratio,
+          bin_step: args.bin_step,
+          volatility: requestedVolatility,
+          active_pct: args.active_pct,
+          price_change_pct: args.price_change_pct,
+        }, config);
+        requestedBinsBelow = plan.bins_below;
+        requestedBinsAbove = 0;
+        args = { ...args, strategy: plan.strategy, bins_below: plan.bins_below, bins_above: 0 };
+        log("screening", `DLMM edge planner: regime=${plan.regime}, bins_below=${plan.bins_below}, netEV=${plan.projected.net_ev_pct}%/day`);
+      }
+
+      const requestedTotalBins = requestedBinsBelow + requestedBinsAbove;
 
       // P1 (ke-08): Dynamic position sizing — scale deploy amount down as volatility rises.
       // scaleFactor = 1 - min(0.4, volatility × 0.08): max 40% reduction at volatility ≥ 5.
@@ -1042,6 +1125,7 @@ async function runSafetyChecks(name, args) {
             positions: getOpenTrades().map((trade) => ({
               pool: trade.pool_address,
               base_mint: trade.base_mint,
+              amount_sol: trade.amount_sol,
             })),
           }
         : await getMyPositions({ force: true });
@@ -1072,6 +1156,89 @@ async function runSafetyChecks(name, args) {
             reason: `Already holding base token ${args.base_mint} in another pool. One position per token only.`,
           };
         }
+      }
+
+      // Intelligent decision layer: explainable pre-copy/deploy judgment.
+      // Defaults to advisory mode so dry-run can keep learning without becoming over-strict.
+      if (config.decision?.enabled !== false) try {
+        const activeBinForDecision = Number(args.active_bin ?? args.activeBin ?? args.current_bin);
+        const lowerBin = args.lower_bin ?? args.bin_range?.min ?? (
+          Number.isFinite(activeBinForDecision) && Number.isFinite(requestedBinsBelow)
+            ? activeBinForDecision - requestedBinsBelow
+            : null
+        );
+        const upperBin = args.upper_bin ?? args.bin_range?.max ?? (
+          Number.isFinite(activeBinForDecision) && Number.isFinite(requestedBinsAbove)
+            ? activeBinForDecision + requestedBinsAbove
+            : null
+        );
+        const decision = await analyzePositionForCopy({
+          poolAddress: args.pool_address,
+          poolName: args.pool_name,
+          lowerBin,
+          upperBin,
+          activeBin: Number.isFinite(activeBinForDecision) ? activeBinForDecision : args.active_bin,
+          feeTvlRatio: args.fee_tvl_ratio ?? args.fee_active_tvl_ratio,
+          volatility: requestedVolatility ?? args.volatility,
+          inRange: true,
+          ageHours: args.age_hours,
+          pnlPct: args.pnl_pct,
+          feesEarnedSol: args.fees_earned_sol,
+        }, {
+          score: Number(args.wallet_score ?? args.ranking_score ?? args.pool_score ?? args.organic_score ?? _poolHealthScore ?? 50),
+          grade: args.wallet_grade ?? args.ranking_grade ?? args.pool_grade,
+        }, config.decision);
+
+        args = { ...args, decision_result: decision };
+        log("decision", `Pre-deploy ${decision.action} confidence=${decision.confidence.toFixed(2)}: ${(decision.reasons || []).slice(0, 2).join("; ")}`);
+        if (config.decision?.enforce === true && decision.action !== "COPY") {
+          return {
+            pass: false,
+            reason: `Decision layer blocked deploy: ${decision.action} (${decision.confidence.toFixed(2)}) — ${(decision.reasons || decision.risks || []).join("; ")}`,
+          };
+        }
+      } catch (err) {
+        log("decision_warn", `Decision layer unavailable, using existing gates: ${err.message}`);
+      }
+
+      // Advanced allocation engine: final pre-deploy sizing and portfolio limit pass.
+      // This keeps the older hard gates intact while adding rank/score-aware sizing hooks.
+      if (config.allocation?.enabled !== false) try {
+        const isDry = process.env.DRY_RUN === "true" || config.dryRun === true;
+        const openPositionCount = positions.total_positions ?? positions.positions.length;
+        const totalSolDeployed = positions.positions.reduce(
+          (sum, p) => sum + (Number(p.amount_sol) || estimatePositionAmountSol(p)),
+          0
+        );
+        const walletSolBalance = isDry
+          ? Number(getSummary().current_sol || 0) + totalSolDeployed
+          : Number((await getWalletBalances()).sol || 0) + totalSolDeployed;
+        const allocation = runAllocation({
+          walletSolBalance,
+          poolVolatility: requestedVolatility ?? Number(args.volatility ?? 2),
+          poolScore: Number(args.pool_score ?? args.organic_score ?? _poolHealthScore ?? 50),
+          openPositionCount,
+          maxPositions: config.risk.maxPositions,
+          totalSolDeployed,
+          dailyPnlUsd: null,
+          consecutiveOor: 0,
+          riskProfile: config.allocation?.riskProfile || "moderate",
+          sizingMode: config.allocation?.sizingMode || "score_scaled",
+        });
+        if (!allocation.allowed) {
+          return {
+            pass: false,
+            reason: `Allocation engine blocked deploy: ${allocation.reason}`,
+          };
+        }
+        const allocated = Math.round(Math.min(deployAmountY, allocation.amountSol) * 1000) / 1000;
+        if (Number.isFinite(allocated) && allocated > 0 && allocated < deployAmountY) {
+          log("screening", `Allocation sizing: ${deployAmountY} SOL -> ${allocated} SOL (${allocation.reason}; risk=${allocation.riskScore})`);
+          deployAmountY = allocated;
+          args = { ...args, amount_y: allocated, amount_sol: allocated };
+        }
+      } catch (err) {
+        log("allocation_warn", `Allocation engine unavailable, using existing gates: ${err.message}`);
       }
 
       // Check amount limits

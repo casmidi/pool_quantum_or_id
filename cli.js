@@ -602,6 +602,58 @@ switch (subcommand) {
     break;
   }
 
+  // ── rank ─────────────────────────────────────────────────────────
+  case "rank": {
+    const { runRankingCycle } = await import("./ranking/top-performers.js");
+    const mode = flags.mode || "auto_top_10";
+    const count = flags.limit ? parseInt(flags.limit) : 10;
+    const result = await runRankingCycle({ mode, count });
+    // If basic ranking returns empty but advanced scoring is available, use it
+    if (!result?.top?.length && result?.snapshot?.wallets?.length) {
+      try {
+        const { rankWalletsAdvanced } = await import("./scoring/composite-scorer.js");
+        const { selectTopWallets } = await import("./scoring/dynamic-selection.js");
+        const ranked = rankWalletsAdvanced(result.snapshot.wallets, flags.advMode || flags.mode || "balanced");
+        const selection = selectTopWallets(ranked, { topN: count, mode: flags.advMode || flags.mode || "balanced" });
+        out({ advanced: true, mode: flags.advMode || "balanced", ...selection });
+        break;
+      } catch { /* fallback */ }
+    }
+    out(result || { message: "Ranking cycle completed" });
+    break;
+  }
+
+  // ── rank-score ────────────────────────────────────────────────────
+  case "rank-score": {
+    const wallet = flags.wallet || argv.find((a, i) => !a.startsWith("-") && i > 0 && a !== "rank-score");
+    if (!wallet) die("Usage: meridian rank-score --wallet <addr> [--mode balanced]");
+    // Try advanced scoring first
+    try {
+      const { rankWalletsAdvanced } = await import("./scoring/composite-scorer.js");
+      const { getWeightProfile } = await import("./scoring/weight-profiles.js");
+      const profile = getWeightProfile(flags.mode || "balanced");
+      const scored = rankWalletsAdvanced([{ address: wallet, label: wallet.slice(0, 8) }], flags.mode || "balanced", profile.thresholds);
+      out({ wallet, advanced: true, mode: flags.mode || "balanced", score: scored[0] });
+      break;
+    } catch { /* fallback */ }
+    const { scoreWalletShort } = await import("./ranking/top-performers.js");
+    out(await scoreWalletShort(wallet));
+    break;
+  }
+
+  // ── rank-modes ─────────────────────────────────────────────────────
+  case "rank-modes": {
+    try {
+      const { getAvailableModes, getWeightProfile } = await import("./scoring/weight-profiles.js");
+      const modes = getAvailableModes();
+      const info = modes.map(m => ({ mode: m, ...getWeightProfile(m) }));
+      out({ modes: info });
+    } catch (e) {
+      out({ modes: ["conservative", "balanced", "aggressive", "momentum"], error: e.message });
+    }
+    break;
+  }
+
   // ── discord-signals ──────────────────────────────────────────────
   case "discord-signals": {
     const sigFile = path.join(process.cwd(), "discord-signals.json");

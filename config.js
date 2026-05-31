@@ -53,6 +53,10 @@ if (u.dryRun !== undefined) process.env.DRY_RUN = String(u.dryRun);
 if (u.publicApiKey) process.env.PUBLIC_API_KEY ||= u.publicApiKey;
 if (u.agentMeridianApiUrl) process.env.AGENT_MERIDIAN_API_URL ||= u.agentMeridianApiUrl;
 
+// Intelligence API keys from user-config.json
+if (u.gmgnApiKey)    process.env.GMGN_API_KEY    ||= u.gmgnApiKey;
+if (u.duneApiKey)    process.env.DUNE_API_KEY    ||= u.duneApiKey;
+
 const indicatorUserConfig = u.chartIndicators ?? {};
 
 function nonEmptyString(...values) {
@@ -116,12 +120,17 @@ export const config = {
   // ─── Pool Screening Thresholds ───────────
   screening: {
     excludeHighSupplyConcentration: u.excludeHighSupplyConcentration ?? true,
-    minFeeActiveTvlRatio: u.minFeeActiveTvlRatio ?? 0.05,
+    minFeeActiveTvlRatio: u.minFeeActiveTvlRatio ?? 0.02,
     minTvl:            u.minTvl            ?? 10_000,
     maxTvl:            u.maxTvl !== undefined ? u.maxTvl : 150_000,
     minVolume:         u.minVolume         ?? 500,
+    minVolumeTvlRatio: u.minVolumeTvlRatio ?? null,
     minOrganic:        u.minOrganic        ?? 60,
     minQuoteOrganic:   u.minQuoteOrganic   ?? 60,
+    minActivePct:      u.minActivePct      ?? null,
+    maxAbsPriceChangePct: u.maxAbsPriceChangePct ?? null,
+    minFeeChangePct:   u.minFeeChangePct   ?? null,
+    minVolumeChangePct: u.minVolumeChangePct ?? null,
     minHolders:        u.minHolders        ?? 500,
     minMcap:           u.minMcap           ?? 150_000,
     maxMcap:           u.maxMcap           ?? 10_000_000,
@@ -183,6 +192,9 @@ export const config = {
     takeProfitPct:         u.takeProfitPct         ?? u.takeProfitFeePct ?? 5,
     minFeePerTvl24h:       u.minFeePerTvl24h       ?? 7,
     minAgeBeforeYieldCheck: u.minAgeBeforeYieldCheck ?? 60, // minutes before low yield can trigger close
+    dryRunMinHoldMinutes:  u.dryRunMinHoldMinutes  ?? 30, // keep simulated deploys visible before paper exits
+    dryRunMaxFeePctPerHour: u.dryRunMaxFeePctPerHour ?? 3, // cap simulated fee accrual per position per hour
+    dryRunMaxUnrealizedPnlPct: u.dryRunMaxUnrealizedPnlPct ?? 25, // sanity cap for open paper PnL
     minSolToOpen:          u.minSolToOpen          ?? 0.55,
     deployAmountSol:       u.deployAmountSol       ?? 0.5,
     gasReserve:            u.gasReserve            ?? 0.2,
@@ -238,9 +250,9 @@ export const config = {
     temperature: u.temperature ?? 0.373,
     maxTokens:   u.maxTokens   ?? 4096,
     maxSteps:    u.maxSteps    ?? 20,
-    managementModel: u.managementModel ?? process.env.LLM_MODEL ?? "openrouter/healer-alpha",
-    screeningModel:  u.screeningModel  ?? process.env.LLM_MODEL ?? "openrouter/hunter-alpha",
-    generalModel:    u.generalModel    ?? process.env.LLM_MODEL ?? "openrouter/healer-alpha",
+    managementModel: u.managementModel ?? process.env.LLM_MODEL ?? "deepseek/deepseek-v4-flash:free",
+    screeningModel:  u.screeningModel  ?? process.env.LLM_MODEL ?? "deepseek/deepseek-v4-flash:free",
+    generalModel:    u.generalModel    ?? process.env.LLM_MODEL ?? "deepseek/deepseek-v4-flash:free",
     reviewModel:     u.aiReviewModel ?? u.reviewModel ?? "anthropic/claude-haiku-4.5",
     hybridReviewEnabled: u.aiHybridReviewEnabled ?? true,
     reviewMinPoolScore:  u.aiReviewMinPoolScore  ?? 72,
@@ -317,6 +329,92 @@ export const config = {
     rsiOverbought: indicatorUserConfig.rsiOverbought ?? 80,
     requireAllIntervals: indicatorUserConfig.requireAllIntervals ?? false,
   },
+
+  // ─── Ranking System ────────────────────────
+  ranking: {
+    enabled:         u.rankingEnabled         ?? true,
+    intervalMin:     u.rankingIntervalMin     ?? 60,    // how often to run ranking cycle
+    topN:            u.rankingTopN            ?? 10,    // top N wallets to return
+    strategyMode:    u.rankingStrategyMode    ?? "auto_top_10",
+    birdeyeApiKey:   u.birdeyeApiKey          ?? process.env.BIRDEYE_API_KEY ?? "",
+    heliusApiKey:    u.heliusApiKey           ?? process.env.HELIUS_API_KEY ?? "",
+    maxWalletsToTrack: u.rankingMaxWallets    ?? 50,    // cap on tracked wallets
+    discoveryPoolLimit: u.rankingDiscoveryPoolLimit ?? 5,
+    topLpersPerPool: u.rankingTopLpersPerPool ?? 4,
+  },
+
+  // ─── Multi-Layer Scoring Engine ───────────────
+  scoring: {
+    enabled:             u.scoringEnabled             ?? true,
+    defaultMode:         u.scoringDefaultMode         ?? "balanced",
+    minScoreThreshold:   u.scoringMinScore            ?? 20,
+    decayLookback:       u.scoringDecayLookback       ?? 3,
+    decayThreshold:      u.scoringDecayThreshold      ?? -15,
+    autoExcludeDecaying: u.scoringAutoExcludeDecaying ?? true,
+    checkCorrelation:    u.scoringCheckCorrelation    ?? true,
+    maxCorrelation:      u.scoringMaxCorrelation      ?? 0.85,
+    // Whitelist / blacklist addresses
+    whitelist:           u.scoringWhitelist           ?? [],
+    blacklist:           u.scoringBlacklist           ?? [],
+    // Factor threshold overrides (optional)
+    thresholds: {
+      pnl7dMin:          u.scoringPnl7dMin  ?? null,
+      pnl30dMin:         u.scoringPnl30dMin ?? null,
+      maxDrawdownMin:    u.scoringDDMin     ?? null,
+      winRateTarget:     u.scoringWinRate   ?? null,
+    },
+  },
+
+  // ─── Intelligence Fusion ───────────────────
+  intelligence: {
+    enabled: u.intelligenceEnabled ?? true,
+
+    // Provider toggles
+    useGmgn:     u.useGmgn     ?? true,
+    useHelius:   u.useHelius   ?? true,    // already configured via HELIUS_API_KEY
+    useDune:     u.useDune     ?? true,    // requires DUNE_API_KEY
+    useFallback: u.useFallback ?? true,    // public APIs, always available
+
+    // Cache TTL overrides (ms)
+    cacheWalletTtl:  u.intelCacheWalletTtl  ?? 5 * 60 * 1000,   // 5 min
+    cacheTopTtl:     u.intelCacheTopTtl     ?? 10 * 60 * 1000,  // 10 min
+    cacheProviderTtl: u.intelCacheProviderTtl ?? 2 * 60 * 1000, // 2 min
+
+    // Fusion strategy
+    // "parallel" = run all providers simultaneously
+    // "sequential" = try primary, fallback on failure
+    fusionStrategy:   u.fusionStrategy   ?? "parallel",
+
+    // Rate limiting
+    rateLimits: {
+      gmgn:      { rpm: u.gmgnRpm      ?? 30,  burst: 5  },
+      dune:      { rpm: u.duneRpm      ?? 10,  burst: 2  },
+      helius:    { rpm: u.heliusRpm    ?? 100, burst: 10 },
+      birdeye:   { rpm: u.birdeyeRpm   ?? 30,  burst: 5  },
+      dexscreener: { rpm: u.dexscreenerRpm ?? 60, burst: 8 },
+      tracklp:   { rpm: u.tracklpRpm   ?? 20,  burst: 3  },
+    },
+
+    // Wallet discovery
+    discoveryIntervalMin: u.intelDiscoveryIntervalMin ?? 120,  // scan for new wallets every 2h
+    maxCandidates:        u.intelMaxCandidates        ?? 50,   // max candidate wallets to scan
+  },
+
+  allocation: {
+    enabled: u.allocationEnabled ?? true,
+    riskProfile: u.allocationRiskProfile ?? "moderate",
+    sizingMode: u.allocationSizingMode ?? "score_scaled",
+  },
+
+  decision: {
+    enabled: u.decisionLayerEnabled ?? true,
+    enforce: u.decisionLayerEnforce ?? false,
+    minScoreToCopy: u.decisionMinScoreToCopy ?? 45,
+    minConfidence: u.decisionMinConfidence ?? 0.6,
+    minRangeQuality: u.decisionMinRangeQuality ?? 50,
+    maxVolatilityForCopy: u.decisionMaxVolatilityForCopy ?? 8,
+    minFeeTvlForCopy: u.decisionMinFeeTvlForCopy ?? 0.02,
+  },
 };
 
 /**
@@ -370,6 +468,11 @@ export function reloadScreeningThresholds() {
     if (fresh.minTvl         != null) s.minTvl         = fresh.minTvl;
     if (fresh.maxTvl         !== undefined) s.maxTvl   = fresh.maxTvl;
     if (fresh.minVolume      != null) s.minVolume      = fresh.minVolume;
+    if (fresh.minVolumeTvlRatio !== undefined) s.minVolumeTvlRatio = fresh.minVolumeTvlRatio;
+    if (fresh.minActivePct !== undefined) s.minActivePct = fresh.minActivePct;
+    if (fresh.maxAbsPriceChangePct !== undefined) s.maxAbsPriceChangePct = fresh.maxAbsPriceChangePct;
+    if (fresh.minFeeChangePct !== undefined) s.minFeeChangePct = fresh.minFeeChangePct;
+    if (fresh.minVolumeChangePct !== undefined) s.minVolumeChangePct = fresh.minVolumeChangePct;
     if (fresh.minBinStep     != null) s.minBinStep     = fresh.minBinStep;
     if (fresh.maxBinStep     != null) s.maxBinStep     = fresh.maxBinStep;
     if (fresh.timeframe         != null) s.timeframe         = fresh.timeframe;

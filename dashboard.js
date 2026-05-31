@@ -32,6 +32,8 @@ const PATHS = {
   dotenv: path.join(BOT_DIR, ".env"),
   pnlLog: path.join(BOT_DIR, "data", "pnl_log.json"),
   aiUsage: path.join(BOT_DIR, "data", "ai_usage.json"),
+  aiProviderAlert: path.join(BOT_DIR, "data", "ai_provider_alert.json"),
+  rankingDb: path.join(BOT_DIR, "ranking-db.json"),
 };
 
 // ── CORS ──────────────────────────────────────────────────────────────────────
@@ -236,7 +238,22 @@ function extractPoolsFromLog(lines) {
 
     const botMatch = parsed.msg.match(/Bot-holder filter: dropped (\S+).*bots ([\d.]+)% > (\d+)%/);
     if (botMatch) {
-      dropped.push({ name: botMatch[1], reason: `bots ${botMatch[2]}% > ${botMatch[3]}%`, status: "dropped", ts: parsed.ts });
+      dropped.push({
+        name: botMatch[1],
+        reason: `bots ${botMatch[2]}% > ${botMatch[3]}%`,
+        status: "dropped",
+        ts: parsed.ts
+      });
+    }
+
+    const scoreMatch = parsed.msg.match(/Pool-score gate: dropped (\S+) — score (\d+) < (\d+)/);
+    if (scoreMatch) {
+      dropped.push({
+        name: scoreMatch[1],
+        reason: `score ${scoreMatch[2]} < ${scoreMatch[3]}`,
+        status: "dropped",
+        ts: parsed.ts
+      });
     }
   }
 
@@ -260,6 +277,72 @@ function getCurrentMonthAICostUsd() {
   const usage = readJSON(PATHS.aiUsage, { months: {} });
   const monthKey = new Date().toISOString().slice(0, 7);
   return Number(usage?.months?.[monthKey]?.cost_usd ?? 0) || 0;
+}
+
+function getAIBudgetStatus(config = {}) {
+  const usage = readJSON(PATHS.aiUsage, { days: {}, months: {} });
+  const providerAlert = readJSON(PATHS.aiProviderAlert, null);
+  const now = new Date();
+  const dayKey = now.toISOString().slice(0, 10);
+  const monthKey = now.toISOString().slice(0, 7);
+  const day = usage?.days?.[dayKey] || {};
+  const month = usage?.months?.[monthKey] || {};
+  const dayCalls = Number(day.calls || 0);
+  const dayCostUsd = Number(day.cost_usd || 0);
+  const monthCalls = Number(month.calls || 0);
+  const monthCostUsd = Number(month.cost_usd || 0);
+  const dailyBudgetUsd = Number(config.aiDailyBudgetUsd || 0);
+  const monthlyBudgetUsd = Number(config.aiMonthlyBudgetUsd || 0);
+  const maxCallsPerDay = Number(config.aiMaxCallsPerDay || 0);
+  const dailyCostPct = dailyBudgetUsd > 0 ? (dayCostUsd / dailyBudgetUsd) * 100 : null;
+  const monthlyCostPct = monthlyBudgetUsd > 0 ? (monthCostUsd / monthlyBudgetUsd) * 100 : null;
+  const dailyCallPct = maxCallsPerDay > 0 ? (dayCalls / maxCallsPerDay) * 100 : null;
+
+  const blockedReasons = [];
+  const warnReasons = [];
+  if (dailyBudgetUsd > 0 && dayCostUsd >= dailyBudgetUsd) {
+    blockedReasons.push(`AI daily budget reached: $${dayCostUsd.toFixed(4)} >= $${dailyBudgetUsd}`);
+  } else if (dailyCostPct != null && dailyCostPct >= 80) {
+    warnReasons.push(`AI daily budget ${dailyCostPct.toFixed(0)}% used`);
+  }
+  if (monthlyBudgetUsd > 0 && monthCostUsd >= monthlyBudgetUsd) {
+    blockedReasons.push(`AI monthly budget reached: $${monthCostUsd.toFixed(4)} >= $${monthlyBudgetUsd}`);
+  } else if (monthlyCostPct != null && monthlyCostPct >= 80) {
+    warnReasons.push(`AI monthly budget ${monthlyCostPct.toFixed(0)}% used`);
+  }
+  if (maxCallsPerDay > 0 && dayCalls >= maxCallsPerDay) {
+    blockedReasons.push(`AI daily call cap reached: ${dayCalls} >= ${maxCallsPerDay}`);
+  } else if (dailyCallPct != null && dailyCallPct >= 80) {
+    warnReasons.push(`AI daily call cap ${dailyCallPct.toFixed(0)}% used`);
+  }
+
+  const providerAlertAgeMs = providerAlert?.ts ? now.getTime() - new Date(providerAlert.ts).getTime() : Infinity;
+  if (providerAlert?.active && providerAlertAgeMs >= 0 && providerAlertAgeMs < 24 * 60 * 60 * 1000) {
+    blockedReasons.push(providerAlert.reason || "OpenRouter budget/credits blocked");
+  }
+
+  const blocked = blockedReasons.length > 0;
+  const warn = blocked || warnReasons.length > 0;
+  return {
+    blocked,
+    warn,
+    reason: blocked ? blockedReasons.join("; ") : warnReasons.join("; "),
+    dayKey,
+    monthKey,
+    dayCalls,
+    dayCostUsd: Math.round(dayCostUsd * 1000000) / 1000000,
+    monthCalls,
+    monthCostUsd: Math.round(monthCostUsd * 1000000) / 1000000,
+    dailyBudgetUsd,
+    monthlyBudgetUsd,
+    maxCallsPerDay,
+    dailyCostPct: dailyCostPct == null ? null : Math.round(dailyCostPct * 10) / 10,
+    monthlyCostPct: monthlyCostPct == null ? null : Math.round(monthlyCostPct * 10) / 10,
+    dailyCallPct: dailyCallPct == null ? null : Math.round(dailyCallPct * 10) / 10,
+    providerAlert: providerAlert?.active && providerAlertAgeMs >= 0 && providerAlertAgeMs < 24 * 60 * 60 * 1000
+      ? { type: providerAlert.type || "provider", ts: providerAlert.ts || null }
+      : null,
+  };
 }
 
 function calcPnlSummary(config = {}, solPrice = 0) {
@@ -335,6 +418,71 @@ function calcPnlSummary(config = {}, solPrice = 0) {
     daily,
     lastUpdated: pnl.last_updated || null,
   };
+}
+
+function getModeFilteredTrades(config = {}) {
+  const pnl = readJSON(PATHS.pnlLog, { trades: [] });
+  const allTrades = Array.isArray(pnl.trades) ? pnl.trades : [];
+  const dotenvForMode = readDotenv(PATHS.dotenv);
+  const isLiveMode = config.dryRun !== undefined
+    ? (config.dryRun === false || config.dryRun === "false")
+    : dotenvForMode.DRY_RUN !== "true";
+  return (isLiveMode
+    ? allTrades.filter(t => !t.is_dry_run)
+    : allTrades.filter(t => t.is_dry_run !== false)
+  ).sort((a, b) => {
+    const at = new Date(a.close_time || a.deploy_time || 0).getTime();
+    const bt = new Date(b.close_time || b.deploy_time || 0).getTime();
+    return bt - at;
+  });
+}
+
+function normalizeTradeHistory(trades = [], solPrice = 0, limit = 50) {
+  return trades.slice(0, limit).map((t) => {
+    const amountSol = Number(t.amount_sol || 0);
+    const pnlSol = Number.isFinite(Number(t.pnl_sol))
+      ? Number(t.pnl_sol)
+      : Number.isFinite(Number(t.paper_unrealized_pnl_sol))
+        ? Number(t.paper_unrealized_pnl_sol)
+        : null;
+    const pnlPct = Number.isFinite(Number(t.pnl_pct))
+      ? Number(t.pnl_pct)
+      : Number.isFinite(Number(t.paper_unrealized_pnl_pct))
+        ? Number(t.paper_unrealized_pnl_pct)
+        : null;
+    const pnlUsd = Number.isFinite(Number(t.pnl_usd))
+      ? Number(t.pnl_usd)
+      : (pnlSol != null && solPrice > 0 ? pnlSol * solPrice : null);
+    const deployMs = new Date(t.deploy_time || 0).getTime();
+    const endMs = new Date(t.close_time || Date.now()).getTime();
+    const minutesHeld = Number.isFinite(Number(t.minutes_held))
+      ? Number(t.minutes_held)
+      : (Number.isFinite(deployMs) && Number.isFinite(endMs) ? Math.max(0, Math.floor((endMs - deployMs) / 60000)) : null);
+    return {
+      id: t.id || t.position_address || t.pool_address || null,
+      pool: t.pool_name || t.pair || "Unknown pool",
+      poolAddress: t.pool_address || null,
+      positionAddress: t.position_address || null,
+      status: t.status || "unknown",
+      mode: t.is_dry_run ? "DRY RUN" : "LIVE",
+      amountSol,
+      strategy: t.strategy || null,
+      binsBelow: t.bins_below ?? null,
+      lowerBin: t.lower_bin ?? null,
+      upperBin: t.upper_bin ?? null,
+      entryBin: t.entry_bin ?? null,
+      activeBin: t.active_bin ?? null,
+      feeTvlRatio: t.fee_tvl_ratio ?? null,
+      organicScore: t.organic_score ?? null,
+      pnlSol,
+      pnlPct,
+      pnlUsd: pnlUsd != null ? Math.round(pnlUsd * 100) / 100 : null,
+      reason: t.close_reason || (t.status === "open" ? "open" : null),
+      deployTime: t.deploy_time || null,
+      closeTime: t.close_time || null,
+      minutesHeld,
+    };
+  });
 }
 
 // ── Cache ─────────────────────────────────────────────────────────────────────
@@ -423,6 +571,7 @@ app.get("/api/status", async (req, res) => {
           lastUpdated: pnlSummary.lastUpdated,
         };
       })(),
+      aiBudget: getAIBudgetStatus(config),
       lastUpdated: state.lastUpdated || null,
       ts: new Date().toISOString(),
     });
@@ -469,6 +618,26 @@ app.get("/api/decisions", (req, res) => {
   res.json(data);
 });
 
+app.get("/api/ranking", (req, res) => {
+  const db = readJSON(PATHS.rankingDb, { snapshots: [], rankingHistory: [], wallets: {}, meta: {} });
+  const snapshots = db.snapshots || [];
+  const latest = snapshots.length ? snapshots[snapshots.length - 1] : null;
+  const entries = latest?.entries || [];
+  res.json({
+    ok: true,
+    meta: db.meta || {},
+    latest: latest ? {
+      ts: latest.ts,
+      mode: latest.mode,
+      count: latest.count,
+      entries,
+    } : null,
+    walletsTracked: Object.keys(db.wallets || {}).length,
+    history: (db.rankingHistory || []).slice(-20).reverse(),
+    ts: new Date().toISOString(),
+  });
+});
+
 app.get("/api/logs", (req, res) => {
   const limit = parseInt(req.query.limit || "100");
   const lines = getLatestLog();
@@ -480,6 +649,8 @@ app.get("/api/pnl", async (req, res) => {
   const solPrice = await fetchSolPrice();
   const config = readJSON(PATHS.userConfig, {});
   const pnlSummary = calcPnlSummary(config, solPrice);
+  const trades = getModeFilteredTrades(config);
+  const limit = Math.max(1, Math.min(200, parseInt(req.query.limit || "50", 10) || 50));
   const dec = readJSON(PATHS.decisions, { decisions: [] });
   const decisionDaily = calcDailyPnl(dec.decisions || []);
   const daily = Object.keys(pnlSummary.daily).length ? pnlSummary.daily : decisionDaily;
@@ -493,6 +664,8 @@ app.get("/api/pnl", async (req, res) => {
     ok: true,
     daily: dailySol,
     dailyUsd: daily,
+    trades: normalizeTradeHistory(trades, solPrice, limit),
+    tradeTotal: trades.length,
     solPrice,
     summary: {
       total:       Math.round(toSol(total) * 10000) / 10000,

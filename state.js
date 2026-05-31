@@ -48,6 +48,26 @@ function save(state) {
   }
 }
 
+/**
+ * Heartbeat for dashboard.
+ * Updates lastUpdated even if no positions/candidates exist.
+ */
+export function touchState(meta = {}) {
+  const state = load();
+
+  if (!state.positions) state.positions = {};
+  if (!state.recentEvents) state.recentEvents = [];
+
+  state.lastScreening = {
+    ts: new Date().toISOString(),
+    ...meta,
+  };
+
+  save(state);
+
+  log("state", "Dashboard heartbeat updated");
+}
+
 // ─── Position Registry ─────────────────────────────────────────
 
 /**

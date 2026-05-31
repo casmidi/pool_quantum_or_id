@@ -39,6 +39,7 @@ export const DEFAULT_PENALTY_CONFIG = {
   sniper_pct:        8,   // Sniper bot % — short-term dump risk
   dev_sold:         20,   // Dev sold all tokens — highest rug risk signal
   wash_trading:     50,   // Wash trading detected — fee yield is fake (hard reject)
+  extreme_fee_spike: 8,
   no_volatility:     8,   // Volatility missing or zero — can't calculate IL properly
   extreme_volatility: 10, // >10% volatility — IL will outrun fee yield in most periods
 };
@@ -79,7 +80,7 @@ function scoreFeeActiveTvlRatio(pool, maxPts) {
   // Range calibrated for 5m timeframe (bot default) and 30m timeframe (dry-scan):
   // 0.003–0.050 covers the realistic deployable pool universe.
   // Bell curve peaks around 0.020 — high enough to matter, not so extreme it's a spike.
-  return normBell(ratio, 0.020, 0.018, maxPts);
+  return normLog(ratio, 0.001, 0.50, maxPts);
 }
 
 function scoreVolume(pool, maxPts) {
@@ -108,7 +109,8 @@ function scoreActivePct(pool, maxPts) {
 function scoreOrganic(pool, maxPts) {
   const score = Number(pool.organic_score ?? pool.base?.organic ?? 0);
   // 70 = minimum (screening enforced), 95+ = excellent. Linear pressure to push toward high organic.
-  return normLinear(score, 70, 97, maxPts);
+  // Relaxed: organic 60+ gets non-zero score. 60→~3pts, 80→~8pts, 95+→full 14pts.
+  return normLinear(score, 60, 97, maxPts);
 }
 
 function scoreHolders(pool, maxPts) {
@@ -128,16 +130,17 @@ function scoreTokenAge(pool, maxPts) {
 }
 
 function scoreVolatilityZone(pool, maxPts) {
-  // DLMM LP sweet spot on Meridian's 0-5+ volatility scale.
-  // Low = low fees. High/extreme = IL/range drift can outrun fee yield.
+  // DLMM LP sweet spot — widened to include higher vol (profitable with wider ranges).
+  // Low = low fees. Medium-high = ideal fee capture with DLMM edge planner.
   const v = Number(pool.volatility ?? 0);
   if (v <= 0) return 0;
   if (v < 0.75) return maxPts * 0.35;
   if (v < 1.5)  return maxPts * 0.75;
-  if (v <= 3.5) return maxPts;
-  if (v <= 5)   return maxPts * 0.45;
+  if (v <= 5.0) return maxPts; // widened from 3.5 → 5.0 — edge planner handles high vol
+  if (v <= 8.0) return maxPts * 0.45;
   return 0;
 }
+
 
 function scoreSmartMoney(pool, maxPts) {
   let pts = 0;
@@ -225,6 +228,13 @@ function calcPenalties(pool, penaltyConfig) {
     totalPenalty += penaltyConfig.extreme_volatility;
   }
 
+  const feeRatio = Number(pool.fee_active_tvl_ratio ?? 0);
+  if (Number.isFinite(feeRatio) && feeRatio > 0.75) {
+    const severity = Math.min(penaltyConfig.extreme_fee_spike, (feeRatio - 0.75) * 2);
+    reasons.push({ reason: `extreme fee/active-TVL spike ${feeRatio.toFixed(3)}`, penalty: Math.round(severity) });
+    totalPenalty += severity;
+  }
+
   return { totalPenalty: Math.round(totalPenalty), reasons };
 }
 
@@ -275,12 +285,14 @@ export function scorePool(pool, weights = DEFAULT_WEIGHTS, penaltyConfig = DEFAU
   const { totalPenalty, reasons: penaltyReasons } = calcPenalties(pool, p);
   const rawScore = Math.max(0, Math.min(100, Math.round(baseScore - totalPenalty)));
 
-  // Grade — thresholds calibrated for >70% win rate target:
-  // Only A gets DEPLOY (high conviction). B = WATCH (monitor for upgrade). C/D = SKIP.
+  // Grade — relaxed thresholds calibrated for broader pool universe.
+  // A = STRONG DEPLOY (high conviction). B = DEPLOY (good candidate).
+  // C = HOLD/LLM-DECIDE (pass to agent for narrative+risk eval).
+  // D = SKIP (only worst-of-the-worst filtered before LLM sees).
   let grade, recommendation;
-  if (rawScore >= 72) { grade = "A"; recommendation = "DEPLOY"; }
-  else if (rawScore >= 58) { grade = "B"; recommendation = "WATCH"; }
-  else if (rawScore >= 44) { grade = "C"; recommendation = "HOLD"; }
+  if (rawScore >= 55) { grade = "A"; recommendation = "DEPLOY"; }
+  else if (rawScore >= 40) { grade = "B"; recommendation = "DEPLOY"; }
+  else if (rawScore >= 25) { grade = "C"; recommendation = "HOLD"; }
   else { grade = "D"; recommendation = "SKIP"; }
 
   // Override: wash trading or dev sold = hard SKIP

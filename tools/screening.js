@@ -6,6 +6,7 @@ import { isBaseMintOnCooldown, isPoolOnCooldown } from "../pool-memory.js";
 import { confirmIndicatorPreset } from "./chart-indicators.js";
 import { getAgentMeridianBase, getAgentMeridianHeaders } from "./agent-meridian.js";
 import { scorePool, applyDarwinWeights } from "../strategy/pool-scorer.js";
+import { planDlmmEntry } from "../strategy/dlmm-edge.js";
 
 const DATAPI_JUP = "https://datapi.jup.ag/v1";
 
@@ -190,6 +191,12 @@ function normalizeScreeningConfig(raw = {}) {
     if (!Number.isFinite(n)) throw new Error(`Invalid screening config: ${name}=${value}`);
     return n;
   }
+  function opt(name, value) {
+    if (value == null) return null;
+    const n = Number(value);
+    if (!Number.isFinite(n)) throw new Error(`Invalid screening config: ${name}=${value}`);
+    return n;
+  }
   const timeframe = raw.timeframe || MIN_VOLATILITY_TIMEFRAME;
   if (!TIMEFRAME_MINUTES[timeframe]) {
     throw new Error(`Invalid screening config: timeframe=${timeframe} (valid: ${Object.keys(TIMEFRAME_MINUTES).join(", ")})`);
@@ -201,6 +208,7 @@ function normalizeScreeningConfig(raw = {}) {
     maxMcap:              raw.maxMcap  == null ? null : req("maxMcap",  raw.maxMcap),
     minHolders:           req("minHolders",           raw.minHolders),
     minVolume:            req("minVolume",             raw.minVolume),
+    minVolumeTvlRatio:    opt("minVolumeTvlRatio",     raw.minVolumeTvlRatio),
     minTvl:               req("minTvl",               raw.minTvl),
     maxTvl:               raw.maxTvl   == null ? null : req("maxTvl",   raw.maxTvl),
     minBinStep:           req("minBinStep",            raw.minBinStep),
@@ -208,6 +216,10 @@ function normalizeScreeningConfig(raw = {}) {
     minFeeActiveTvlRatio: req("minFeeActiveTvlRatio",  raw.minFeeActiveTvlRatio),
     minOrganic:           req("minOrganic",            raw.minOrganic),
     minQuoteOrganic:      req("minQuoteOrganic",       raw.minQuoteOrganic),
+    minActivePct:         opt("minActivePct",          raw.minActivePct),
+    maxAbsPriceChangePct: opt("maxAbsPriceChangePct",  raw.maxAbsPriceChangePct),
+    minFeeChangePct:      opt("minFeeChangePct",       raw.minFeeChangePct),
+    minVolumeChangePct:   opt("minVolumeChangePct",    raw.minVolumeChangePct),
   };
   // Relational validation — catch inverted ranges before they silently return 0 results
   if (cfg.maxMcap != null && cfg.maxMcap < cfg.minMcap)
@@ -314,6 +326,10 @@ function getRawPoolScreeningRejectReason(pool, s) {
   const feeActiveTvlRatio = numeric(pool?.fee_active_tvl_ratio);
   const volatility = numeric(pool?.volatility);
   const volume = numeric(pool?.volume);
+  const activePct = numeric(pool?.active_positions_pct);
+  const priceChangePct = numeric(pool?.pool_price_change_pct);
+  const feeChangePct = numeric(pool?.fee_change_pct);
+  const volumeChangePct = numeric(pool?.volume_change_pct);
   const holders = numeric(pool?.base_token_holders);
   const mcap = numeric(base?.market_cap);
   const baseOrganic = numeric(base?.organic_score);
@@ -335,6 +351,21 @@ function getRawPoolScreeningRejectReason(pool, s) {
   if (volume == null || volume < s.minVolume) return `volume ${volume ?? "unknown"} below minVolume ${s.minVolume}`;
   if (tvl == null || tvl < s.minTvl) return `TVL ${tvl ?? "unknown"} below minTvl ${s.minTvl}`;
   if (s.maxTvl != null && tvl > s.maxTvl) return `TVL ${tvl} above maxTvl ${s.maxTvl}`;
+  if (s.minVolumeTvlRatio != null && tvl > 0 && volume / tvl < s.minVolumeTvlRatio) {
+    return `volume/TVL ${(volume / tvl).toFixed(4)} below minVolumeTvlRatio ${s.minVolumeTvlRatio}`;
+  }
+  if (s.minActivePct != null && (activePct == null || activePct < s.minActivePct)) {
+    return `active liquidity ${activePct ?? "unknown"}% below minActivePct ${s.minActivePct}%`;
+  }
+  if (s.maxAbsPriceChangePct != null && priceChangePct != null && Math.abs(priceChangePct) > s.maxAbsPriceChangePct) {
+    return `price change ${priceChangePct}% exceeds maxAbsPriceChangePct ${s.maxAbsPriceChangePct}%`;
+  }
+  if (s.minFeeChangePct != null && feeChangePct != null && feeChangePct < s.minFeeChangePct) {
+    return `fee change ${feeChangePct}% below minFeeChangePct ${s.minFeeChangePct}%`;
+  }
+  if (s.minVolumeChangePct != null && volumeChangePct != null && volumeChangePct < s.minVolumeChangePct) {
+    return `volume change ${volumeChangePct}% below minVolumeChangePct ${s.minVolumeChangePct}%`;
+  }
   if (binStep == null || binStep < s.minBinStep) return `bin_step ${binStep ?? "unknown"} below minBinStep ${s.minBinStep}`;
   if (binStep > s.maxBinStep) return `bin_step ${binStep} above maxBinStep ${s.maxBinStep}`;
   if (feeActiveTvlRatio == null || feeActiveTvlRatio < s.minFeeActiveTvlRatio) {
@@ -827,12 +858,33 @@ export async function getTopCandidates({ limit = 10 } = {}) {
   const eligible = pools
     .filter((p) => {
       const tvl = Number(p.tvl ?? p.active_tvl ?? 0);
+      const volume = Number(p.volume_window ?? 0);
       if (Number.isFinite(minTvl) && minTvl > 0 && tvl < minTvl) {
         pushFilteredReason(filteredOut, p, `TVL $${tvl} below minTvl $${minTvl}`);
         return false;
       }
       if (Number.isFinite(maxTvl) && maxTvl > 0 && tvl > maxTvl) {
         pushFilteredReason(filteredOut, p, `TVL $${tvl} above maxTvl $${maxTvl}`);
+        return false;
+      }
+      if (s.minVolumeTvlRatio != null && tvl > 0 && volume / tvl < s.minVolumeTvlRatio) {
+        pushFilteredReason(filteredOut, p, `volume/TVL ${(volume / tvl).toFixed(4)} below minVolumeTvlRatio ${s.minVolumeTvlRatio}`);
+        return false;
+      }
+      if (s.minActivePct != null && (p.active_pct == null || Number(p.active_pct) < s.minActivePct)) {
+        pushFilteredReason(filteredOut, p, `active liquidity ${p.active_pct ?? "unknown"}% below minActivePct ${s.minActivePct}%`);
+        return false;
+      }
+      if (s.maxAbsPriceChangePct != null && p.price_change_pct != null && Math.abs(Number(p.price_change_pct)) > s.maxAbsPriceChangePct) {
+        pushFilteredReason(filteredOut, p, `price change ${p.price_change_pct}% exceeds maxAbsPriceChangePct ${s.maxAbsPriceChangePct}%`);
+        return false;
+      }
+      if (s.minFeeChangePct != null && p.fee_change_pct != null && Number(p.fee_change_pct) < s.minFeeChangePct) {
+        pushFilteredReason(filteredOut, p, `fee change ${p.fee_change_pct}% below minFeeChangePct ${s.minFeeChangePct}%`);
+        return false;
+      }
+      if (s.minVolumeChangePct != null && p.volume_change_pct != null && Number(p.volume_change_pct) < s.minVolumeChangePct) {
+        pushFilteredReason(filteredOut, p, `volume change ${p.volume_change_pct}% below minVolumeChangePct ${s.minVolumeChangePct}`);
         return false;
       }
       const feeActiveTvlRatio = Number(p.fee_active_tvl_ratio);
@@ -1165,6 +1217,7 @@ export async function getTopCandidates({ limit = 10 } = {}) {
         pool.pool_recommendation = scored.recommendation;
         pool.volatility_zone     = scored.volatility_zone;
         pool.score_breakdown     = scored.breakdown;
+        pool.dlmm_plan           = planDlmmEntry(pool, config);
         scoredEligible.push(pool);
       } catch (err) {
         log("screening", `Pool scorer failed for ${pool.name}: ${err.message}`);
@@ -1174,9 +1227,18 @@ export async function getTopCandidates({ limit = 10 } = {}) {
     const minPoolScore = config.screening.minPoolScore;
     const scoreGatedEligible = scoredEligible.filter((pool) => {
       const score = Number(pool.pool_score ?? 0);
+      // Unified gate: use minPoolScore as single threshold.
+      // Removed separate SKIP recommendation gate — pool-scorer grade thresholds
+      // now let C-grade pools (25+) through to the LLM for narrative+risk eval.
+      // Only hard-SKIP on wash trading / dev-dump (overridden in pool-scorer).
       if (minPoolScore != null && Number.isFinite(minPoolScore) && score < minPoolScore) {
         pushFilteredReason(filteredOut, pool, `pool score ${score} below minPoolScore ${minPoolScore}`);
         log("screening", `Pool-score gate: dropped ${pool.name} — score ${score} < ${minPoolScore} (grade ${pool.pool_grade ?? "?"})`);
+        return false;
+      }
+      if (pool.is_wash || pool.dev_sold_all) {
+        pushFilteredReason(filteredOut, pool, `wash/dev-sold hard SKIP (score ${score})`);
+        log("screening", `Pool-score gate: dropped ${pool.name} — wash/dev-sold (score ${score})`);
         return false;
       }
       return true;

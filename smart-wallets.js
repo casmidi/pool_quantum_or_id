@@ -51,6 +51,11 @@ export function listSmartWallets() {
   return { total: wallets.length, wallets };
 }
 
+export function getManagedWallets() {
+  const { wallets } = loadWallets();
+  return Array.isArray(wallets) ? wallets : [];
+}
+
 // Cache wallet positions for 5 minutes to avoid hammering RPC
 const _cache = new Map(); // address -> { positions, fetchedAt }
 const CACHE_TTL = 5 * 60 * 1000;

@@ -1,5 +1,6 @@
 import OpenAI from "openai";
 import { jsonrepair } from "jsonrepair";
+import fs from "fs";
 import { buildSystemPrompt } from "./prompt.js";
 import { executeTool } from "./tools/executor.js";
 import { tools } from "./tools/definitions.js";
@@ -7,6 +8,14 @@ import { tools } from "./tools/definitions.js";
 const MANAGER_TOOLS  = new Set(["close_position", "claim_fees", "close_all_positions", "swap_token", "get_position_pnl", "get_my_positions", "get_wallet_balance"]);
 const SCREENER_TOOLS = new Set(["deploy_position", "get_active_bin", "get_top_candidates", "check_smart_wallets_on_pool", "get_token_holders", "get_token_narrative", "get_token_info", "search_pools", "get_pool_memory", "get_wallet_balance", "get_my_positions"]);
 const GENERAL_INTENT_ONLY_TOOLS = new Set([
+  "run_ranking_cycle",
+  "score_wallet",
+  "score_wallet_advanced",
+  "select_top_wallets",
+  "fuse_wallet_data",
+  "fuse_multiple_wallets",
+  "get_provider_status",
+  "get_top_performer_candidates",
   "self_update",
   "update_config",
   "add_to_blacklist",
@@ -44,6 +53,8 @@ const INTENT_TOOLS = {
   smartwallet: new Set(["add_smart_wallet", "remove_smart_wallet", "list_smart_wallets", "check_smart_wallets_on_pool"]),
   study:       new Set(["study_top_lpers", "get_top_lpers", "get_pool_detail", "search_pools", "get_token_info", "discover_pools", "add_smart_wallet", "list_smart_wallets"]),
   performance: new Set(["get_performance_history", "get_my_positions", "get_position_pnl"]),
+  ranking:    new Set(["run_ranking_cycle", "score_wallet", "score_wallet_advanced", "select_top_wallets"]),
+  fusion:     new Set(["fuse_wallet_data", "fuse_multiple_wallets", "get_provider_status", "get_top_performer_candidates"]),
   lessons:     new Set(["add_lesson", "pin_lesson", "unpin_lesson", "list_lessons", "clear_lessons"]),
 };
 
@@ -64,6 +75,8 @@ const INTENT_PATTERNS = [
   { intent: "smartwallet", re: /\b(smart wallet|kol|whale|watch.?list|add wallet|remove wallet|list wallet|tracked wallet|check pool|who.?s in|wallets in|add to (smart|watch|kol))\b/i },
   { intent: "study",       re: /\b(study top|top lpers?|best lpers?|who.?s lping|lp behavior|lpers?)\b/i },
   { intent: "performance", re: /\b(performance|history|how.?s the bot|how.?s it doing|stats|report)\b/i },
+  { intent: "ranking",     re: /\b(rank|ranking|top wallet|score wallet|wallet score|leaderboard|top performer|best wallet|select wallet|wallet selection|strategy mode|scoring mode|conservative|aggressive|momentum|hybrid|profile)\b/i },
+  { intent: "fusion",      re: /\b(fuse|fusion|intelligence|aggregate wallet|provider status|top candidate|multi.?source|gmgn|dune|helius|birdeye|dexscreener)\b/i },
   { intent: "lessons",     re: /\b(lesson|learned|teach|pin|unpin|clear lesson|what did you learn)\b/i },
 ];
 
@@ -91,6 +104,7 @@ import { canCallAI, recordAIUsage } from "./ai-budget.js";
 import { getStateSummary } from "./state.js";
 import { getLessonsForPrompt, getPerformanceSummary } from "./lessons.js";
 import { getDecisionSummary } from "./decision-log.js";
+import { isEnabled as telegramEnabled, sendMessage } from "./telegram.js";
 
 // Supports OpenRouter (default) or any OpenAI-compatible local server (e.g. LM Studio)
 // To use LM Studio: set LLM_BASE_URL=http://localhost:1234/v1 and LLM_API_KEY=lm-studio in .env
@@ -100,7 +114,81 @@ const client = new OpenAI({
   timeout: 5 * 60 * 1000,
 });
 
-const DEFAULT_MODEL = process.env.LLM_MODEL || "openrouter/healer-alpha";
+// Ordered fallback chain — tries each model in order on 404/401/429/model-not-found.
+// deepseek/deepseek-v4-flash:free is the primary choice: free, fast, good quality.
+// Falls back through the openrouter/free router (auto-routes to any working free model)
+// and then individual known-working models.
+// openrouter/free is the most reliable fallback — it dynamically selects from available free models.
+const MODEL_CHAIN = [
+  process.env.LLM_MODEL || "deepseek/deepseek-v4-flash:free",
+  "openrouter/free",
+  "google/gemini-2.0-flash-lite:free",
+  "deepseek/deepseek-chat:free",
+].filter(Boolean);
+const DEFAULT_MODEL = MODEL_CHAIN[0];
+let lastAIBudgetTelegramWarn = 0;
+let lastOpenRouterBudgetTelegramWarn = 0;
+const AI_PROVIDER_ALERT_PATH = new URL("./data/ai_provider_alert.json", import.meta.url);
+
+function getErrorMessage(error) {
+  return String(error?.message || error?.error?.message || error?.response?.data?.error?.message || error || "");
+}
+
+function getOpenRouterBudgetReason(error) {
+  const message = getErrorMessage(error);
+  const status = Number(error?.status || error?.response?.status || 0);
+  const code = String(error?.code || error?.error?.code || "");
+  if (
+    status === 402 ||
+    /\b(insufficient|not enough|exhausted|out of)\b.*\b(credit|credits|balance|budget|quota)\b/i.test(message) ||
+    /\b(payment required|billing|quota exceeded|credits exhausted|insufficient credits)\b/i.test(message) ||
+    /\b(insufficient_credits|quota_exceeded|billing)\b/i.test(code)
+  ) {
+    return `OpenRouter budget/credits blocked: ${message.slice(0, 240) || `HTTP ${status}`}`;
+  }
+  return null;
+}
+
+function writeAIProviderAlert(reason) {
+  try {
+    fs.mkdirSync(new URL("./data/", import.meta.url), { recursive: true });
+    fs.writeFileSync(AI_PROVIDER_ALERT_PATH, JSON.stringify({
+      active: true,
+      type: "openrouter_budget",
+      reason,
+      ts: new Date().toISOString(),
+    }, null, 2));
+  } catch (_) {}
+}
+
+function notifyAIBudgetBlocked(reason) {
+  const now = Date.now();
+  if (now - lastAIBudgetTelegramWarn < 60 * 60 * 1000) return;
+  lastAIBudgetTelegramWarn = now;
+  if (!telegramEnabled()) return;
+  sendMessage([
+    "AI BUDGET WARNING",
+    "",
+    reason,
+    "",
+    "Bot masih hidup, tapi keputusan AI/deploy akan tertahan sampai budget/call cap direset atau setting dinaikkan.",
+  ].join("\n")).catch(() => {});
+}
+
+function notifyOpenRouterBudgetBlocked(reason) {
+  writeAIProviderAlert(reason);
+  const now = Date.now();
+  if (now - lastOpenRouterBudgetTelegramWarn < 60 * 60 * 1000) return;
+  lastOpenRouterBudgetTelegramWarn = now;
+  if (!telegramEnabled()) return;
+  sendMessage([
+    "OPENROUTER BUDGET WARNING",
+    "",
+    reason,
+    "",
+    "Bot masih hidup, tapi AI/deploy akan tertahan sampai credit/budget OpenRouter ditambah atau model/provider diganti.",
+  ].join("\n")).catch(() => {});
+}
 
 const MUTATING_TOOL_INTENTS = /\b(deploy|open position|add liquidity|lp into|invest in|close|exit|withdraw|remove liquidity|claim|harvest|collect|swap|convert|sell|exchange|block|unblock|blacklist|add smart wallet|remove smart wallet|add wallet|remove wallet|pin|unpin|clear lesson|add lesson|set active strategy|remove strategy|add strategy|set |change |update |self.?update|pull latest|git pull|update yourself)\b/i;
 const LIVE_DATA_TOOL_INTENTS = /\b(balance|wallet|position|portfolio|pnl|yield|range|show positions|open positions|screen|candidate|find pool|search|research|analyze|check pool|token holders|narrative|study top|top lpers?|lp behavior|who.?s lping|performance|history|stats|report|list smart wallets|list blacklist|list blocked deployers|list lessons)\b/i;
@@ -155,18 +243,26 @@ export async function completeAI({ model = null, agentType = "GENERAL", messages
   const budgetCheck = canCallAI({ model: activeModel, agentType });
   if (!budgetCheck.allowed) {
     log("ai_budget_warn", budgetCheck.reason);
+    notifyAIBudgetBlocked(budgetCheck.reason);
     return {
       content: `AI paused by budget guard: ${budgetCheck.reason}`,
       budget_blocked: true,
     };
   }
 
-  const response = await client.chat.completions.create({
-    model: activeModel,
-    messages,
-    temperature,
-    max_tokens: maxTokens,
-  });
+  let response;
+  try {
+    response = await client.chat.completions.create({
+      model: activeModel,
+      messages,
+      temperature,
+      max_tokens: maxTokens,
+    });
+  } catch (error) {
+    const openRouterBudgetReason = getOpenRouterBudgetReason(error);
+    if (openRouterBudgetReason) notifyOpenRouterBudgetBlocked(openRouterBudgetReason);
+    throw error;
+  }
 
   if (!response.choices?.length) {
     throw new Error(`API returned no choices: ${response.error?.message || JSON.stringify(response)}`);
@@ -219,6 +315,7 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
       const budgetCheck = canCallAI({ model: activeModel, agentType });
       if (!budgetCheck.allowed) {
         log("ai_budget_warn", budgetCheck.reason);
+        notifyAIBudgetBlocked(budgetCheck.reason);
         return {
           content: `AI paused by budget guard: ${budgetCheck.reason}`,
           userMessage: goal,
@@ -226,15 +323,18 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
         };
       }
 
-      // Retry up to 3 times on transient provider errors (502, 503, 529)
-      const FALLBACK_MODEL = "stepfun/step-3.5-flash:free";
-      let response;
+      // Retry with model fallback chain on transient errors or 404 (model not found)
       let usedModel = activeModel;
+      let modelChainIndex = MODEL_CHAIN.indexOf(usedModel);
+      if (modelChainIndex === -1) modelChainIndex = 0;
+      let response;
       // Force a tool call on step 0 for action intents — prevents the model from inventing deploy/close outcomes
       const ACTION_INTENTS = /\b(deploy|open|add liquidity|close|exit|withdraw|claim|swap|block|unblock)\b/i;
       let toolChoice = (step === 0 && (ACTION_INTENTS.test(goal) || mustUseRealTool)) ? "required" : "auto";
 
-      for (let attempt = 0; attempt < 3; attempt++) {
+      // Try up to 5 attempts with model fallback — if a model returns 404/not-found,
+      // try the next in the chain instead of crashing.
+      for (let attempt = 0; attempt < 5; attempt++) {
         try {
           response = await client.chat.completions.create({
             model: usedModel,
@@ -245,6 +345,23 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
             max_tokens: maxOutputTokens ?? config.llm.maxTokens,
           });
         } catch (error) {
+          const openRouterBudgetReason = getOpenRouterBudgetReason(error);
+          if (openRouterBudgetReason) notifyOpenRouterBudgetBlocked(openRouterBudgetReason);
+          // Model not found (404) — try next in chain
+          const errMsg = getErrorMessage(error);
+          const isModelNotFound = errMsg.includes('404') || errMsg.includes('model not found') || errMsg.includes('not found') || error?.status === 404;
+          
+          if (isModelNotFound && modelChainIndex < MODEL_CHAIN.length - 1) {
+            modelChainIndex++;
+            usedModel = MODEL_CHAIN[modelChainIndex];
+            log("agent", `Model ${MODEL_CHAIN[modelChainIndex - 1]} not found — falling back to ${usedModel}`);
+            attempt -= 1; // don't count this as an attempt, retry with new model
+            continue;
+          } else if (isModelNotFound) {
+            log("error", `All ${MODEL_CHAIN.length} models exhausted — last error: ${errMsg}`);
+            throw new Error(`All models exhausted: ${errMsg}`);
+          }
+          
           if (providerMode === "system" && isSystemRoleError(error)) {
             providerMode = "user_embedded";
             messages = buildMessages(systemPrompt, sessionHistory, goal, providerMode);
@@ -258,17 +375,27 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
             attempt -= 1;
             continue;
           }
+          // For other errors (auth, rate limit, etc.), try next model in chain
+          if (modelChainIndex < MODEL_CHAIN.length - 1) {
+            modelChainIndex++;
+            usedModel = MODEL_CHAIN[modelChainIndex];
+            log("agent", `Model ${MODEL_CHAIN[modelChainIndex - 1]} error: ${errMsg.slice(0, 80)} — falling back to ${usedModel}`);
+            attempt -= 1;
+            continue;
+          }
           throw error;
         }
         if (response.choices?.length) break;
         const errCode = response.error?.code;
-        if (errCode === 502 || errCode === 503 || errCode === 529) {
-          const wait = (attempt + 1) * 5000;
-          if (attempt === 1 && usedModel !== FALLBACK_MODEL) {
-            usedModel = FALLBACK_MODEL;
-            log("agent", `Switching to fallback model ${FALLBACK_MODEL}`);
+        if (errCode === 502 || errCode === 503 || errCode === 529 || errCode === 404) {
+          const wait = (attempt + 1) * 3000;
+          // Try next model in chain for server errors too
+          if (modelChainIndex < MODEL_CHAIN.length - 1) {
+            modelChainIndex++;
+            usedModel = MODEL_CHAIN[modelChainIndex];
+            log("agent", `HTTP ${errCode} — falling back to ${usedModel}`);
           } else {
-            log("agent", `Provider error ${errCode}, retrying in ${wait / 1000}s (attempt ${attempt + 1}/3)`);
+            log("agent", `Provider error ${errCode}, retrying in ${wait / 1000}s (attempt ${attempt + 1}/5)`);
             await new Promise((r) => setTimeout(r, wait));
           }
         } else {
@@ -438,6 +565,8 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
 
       messages.push(...toolResults);
     } catch (error) {
+      const openRouterBudgetReason = getOpenRouterBudgetReason(error);
+      if (openRouterBudgetReason) notifyOpenRouterBudgetBlocked(openRouterBudgetReason);
       log("error", `Agent loop error at step ${step}: ${error.message}`);
 
       // If it's a rate limit, wait and retry
