@@ -1240,6 +1240,47 @@ Strategy modes apply different weight profiles to selection.`,
   {
     type: "function",
     function: {
+      name: "run_copy_engine",
+      description: `Scan the top-ranked LP wallets, inspect their open Meteora DLMM positions, and produce explainable copy signals.
+
+The copy engine monitors top wallet positions, applies the decision layer, deduplicates recent signals, and returns COPY/HOLD/SKIP diagnostics with suggested deploy args for COPY signals.`,
+      parameters: {
+        type: "object",
+        properties: {
+          count: { type: "number", description: "Number of top wallets to scan" },
+          mode: {
+            type: "string",
+            enum: ["conservative", "balanced", "aggressive", "momentum", "hybrid", "auto_top_10"],
+            description: "Ranking/scoring mode to use"
+          },
+          force_ranking: { type: "boolean", description: "Refresh ranking before scanning wallets" }
+        }
+      }
+    }
+  },
+
+  {
+    type: "function",
+    function: {
+      name: "get_copy_signals",
+      description: "Return recent copy-engine signals generated from top wallet DLMM position monitoring.",
+      parameters: {
+        type: "object",
+        properties: {
+          limit: { type: "number", description: "Maximum number of recent signals to return" },
+          action: {
+            type: "string",
+            enum: ["COPY", "HOLD", "SKIP"],
+            description: "Optional action filter"
+          }
+        }
+      }
+    }
+  },
+
+  {
+    type: "function",
+    function: {
       name: "add_to_blacklist",
       description: `Permanently blacklist a base token mint so it's never deployed into again.
 Use when a token rugs, shows wash trading, or is otherwise unsafe.

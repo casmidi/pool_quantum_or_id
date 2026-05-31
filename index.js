@@ -39,6 +39,7 @@ import { runRankingCycle, scoreWalletShort } from "./ranking/top-performers.js";
 import { rankWalletsAdvanced, scoreWalletAdvanced } from "./scoring/composite-scorer.js";
 import { selectTopWallets, formatSelection } from "./scoring/dynamic-selection.js";
 import { getWeightProfile, getAvailableModes } from "./scoring/weight-profiles.js";
+import { runCopyEngineCycle, getCopySignals } from "./copy-engine/position-monitor.js";
 
 const entrypointPath = process.env.pm_exec_path || process.argv[1];
 const isMain = entrypointPath
@@ -1164,6 +1165,26 @@ Summarize the current portfolio health, total fees earned, and performance of al
     }
   });
 
+  const copyIntervalMin = Math.max(5, Math.min(59, Number(config.copyTrading?.intervalMin || 15)));
+  const copyTask = cron.schedule(`*/${copyIntervalMin} * * * *`, async () => {
+    if (!config.copyTrading?.enabled || _managementBusy || _screeningBusy) return;
+    log("cron", "Starting copy-engine position scan");
+    try {
+      const result = await runCopyEngineCycle({ dryRun: config.copyTrading?.dryRun !== false });
+      const copySignals = result?.signals || [];
+      log("cron", `Copy-engine scan complete: ${copySignals.length} signal(s)`);
+      if (telegramEnabled() && copySignals.length > 0) {
+        const lines = copySignals.slice(0, 5).map((signal, i) => {
+          const pool = signal.poolName || signal.pool?.slice?.(0, 8) || "unknown";
+          return `${i + 1}. ${pool} | wallet #${signal.walletRank} score ${signal.walletScore} | confidence ${(signal.confidence * 100).toFixed(0)}%`;
+        });
+        await sendMessage(`COPY ENGINE SIGNALS\n\n${lines.join("\n")}`).catch(() => {});
+      }
+    } catch (error) {
+      log("cron_error", `Copy-engine scan failed: ${error.message}`);
+    }
+  });
+
   // Lightweight 30s PnL poller — updates trailing TP state between management cycles, no LLM
   let _pnlPollBusy = false;
   const pnlPollInterval = setInterval(async () => {
@@ -1226,7 +1247,7 @@ Summarize the current portfolio health, total fees earned, and performance of al
     }
   }, 30_000);
 
-  _cronTasks = [mgmtTask, screenTask, healthTask, briefingTask, briefingWatchdog, rankingTask];
+  _cronTasks = [mgmtTask, screenTask, healthTask, briefingTask, briefingWatchdog, rankingTask, copyTask];
   // Store interval ref so stopCronJobs can clear it
   _cronTasks._pnlPollInterval = pnlPollInterval;
   log("cron", `Cycles started — management every ${config.schedule.managementIntervalMin}m, screening every ${config.schedule.screeningIntervalMin}m`);
@@ -2117,6 +2138,46 @@ async function telegramHandler(msg) {
       await sendMessage(`🏆 Top Wallets (${modeLabel})\n\n${lines.join("\n")}`).catch(() => {});
     } catch (e) {
       await sendMessage(`Ranking error: ${e.message}`).catch(() => {});
+    }
+    return;
+  }
+
+  if (text === "/copy-scan") {
+    try {
+      const result = await runCopyEngineCycle({ forceRanking: false, dryRun: config.copyTrading?.dryRun !== false });
+      const signals = result?.signals || [];
+      const summary = result?.summary || {};
+      if (!signals.length) {
+        await sendMessage(`Copy scan complete: no COPY signals.\nWallets: ${summary.wallets || 0} | Positions: ${summary.positions || 0} | Ignored: ${summary.ignored || 0}`).catch(() => {});
+        return;
+      }
+      const lines = signals.slice(0, 10).map((s, i) => {
+        const pool = s.poolName || s.pool?.slice?.(0, 8) || "unknown";
+        const amount = s.deployArgs?.amount_sol ? `${s.deployArgs.amount_sol} SOL` : "? SOL";
+        return `${i + 1}. ${pool} | #${s.walletRank} ${s.walletLabel} | ${amount} | ${(s.confidence * 100).toFixed(0)}%`;
+      });
+      await sendMessage(`COPY SIGNALS (${signals.length})\n\n${lines.join("\n")}`).catch(() => {});
+    } catch (e) {
+      await sendMessage(`Copy scan error: ${e.message}`).catch(() => {});
+    }
+    return;
+  }
+
+  if (text === "/copy-signals") {
+    try {
+      const signals = getCopySignals({ limit: 10 });
+      if (!signals.length) {
+        await sendMessage("No recent copy-engine signals.").catch(() => {});
+        return;
+      }
+      const lines = signals.map((s, i) => {
+        const pool = s.poolName || s.pool?.slice?.(0, 8) || "unknown";
+        const amount = s.deployArgs?.amount_sol ? `${s.deployArgs.amount_sol} SOL` : "? SOL";
+        return `${i + 1}. ${pool} | ${s.action} | #${s.walletRank} ${s.walletLabel} | ${amount} | ${(s.confidence * 100).toFixed(0)}%`;
+      });
+      await sendMessage(`RECENT COPY SIGNALS\n\n${lines.join("\n")}`).catch(() => {});
+    } catch (e) {
+      await sendMessage(`Copy signals error: ${e.message}`).catch(() => {});
     }
     return;
   }

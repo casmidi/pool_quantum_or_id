@@ -12,6 +12,8 @@ const GENERAL_INTENT_ONLY_TOOLS = new Set([
   "score_wallet",
   "score_wallet_advanced",
   "select_top_wallets",
+  "run_copy_engine",
+  "get_copy_signals",
   "fuse_wallet_data",
   "fuse_multiple_wallets",
   "get_provider_status",
@@ -54,6 +56,7 @@ const INTENT_TOOLS = {
   study:       new Set(["study_top_lpers", "get_top_lpers", "get_pool_detail", "search_pools", "get_token_info", "discover_pools", "add_smart_wallet", "list_smart_wallets"]),
   performance: new Set(["get_performance_history", "get_my_positions", "get_position_pnl"]),
   ranking:    new Set(["run_ranking_cycle", "score_wallet", "score_wallet_advanced", "select_top_wallets"]),
+  copy:       new Set(["run_copy_engine", "get_copy_signals", "run_ranking_cycle", "select_top_wallets", "get_my_positions", "get_wallet_balance"]),
   fusion:     new Set(["fuse_wallet_data", "fuse_multiple_wallets", "get_provider_status", "get_top_performer_candidates"]),
   lessons:     new Set(["add_lesson", "pin_lesson", "unpin_lesson", "list_lessons", "clear_lessons"]),
 };
@@ -76,6 +79,7 @@ const INTENT_PATTERNS = [
   { intent: "study",       re: /\b(study top|top lpers?|best lpers?|who.?s lping|lp behavior|lpers?)\b/i },
   { intent: "performance", re: /\b(performance|history|how.?s the bot|how.?s it doing|stats|report)\b/i },
   { intent: "ranking",     re: /\b(rank|ranking|top wallet|score wallet|wallet score|leaderboard|top performer|best wallet|select wallet|wallet selection|strategy mode|scoring mode|conservative|aggressive|momentum|hybrid|profile)\b/i },
+  { intent: "copy",        re: /\b(copy engine|copy.?trade|copy signal|copy signals|master wallet|top wallet positions?|follow wallet|follow position)\b/i },
   { intent: "fusion",      re: /\b(fuse|fusion|intelligence|aggregate wallet|provider status|top candidate|multi.?source|gmgn|dune|helius|birdeye|dexscreener)\b/i },
   { intent: "lessons",     re: /\b(lesson|learned|teach|pin|unpin|clear lesson|what did you learn)\b/i },
 ];

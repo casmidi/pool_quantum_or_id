@@ -415,6 +415,23 @@ export const config = {
     maxVolatilityForCopy: u.decisionMaxVolatilityForCopy ?? 8,
     minFeeTvlForCopy: u.decisionMinFeeTvlForCopy ?? 0.02,
   },
+
+  copyTrading: {
+    enabled: u.copyTradingEnabled ?? true,
+    dryRun: u.copyTradingDryRun ?? true,
+    intervalMin: u.copyTradingIntervalMin ?? 15,
+    topWalletCount: u.copyTradingTopWalletCount ?? 10,
+    strategyMode: u.copyTradingStrategyMode ?? u.rankingStrategyMode ?? "balanced",
+    rankingMaxAgeMinutes: u.copyTradingRankingMaxAgeMinutes ?? 360,
+    rankingHardMaxAgeMinutes: u.copyTradingRankingHardMaxAgeMinutes ?? 1440,
+    maxPositionsPerWallet: u.copyTradingMaxPositionsPerWallet ?? 3,
+    walletFetchTimeoutMs: u.copyTradingWalletFetchTimeoutMs ?? 20_000,
+    dedupeMinutes: u.copyTradingDedupeMinutes ?? 720,
+    baseAmountSol: u.copyTradingBaseAmountSol ?? u.deployAmountSol ?? 0.1,
+    maxAmountSol: u.copyTradingMaxAmountSol ?? u.maxDeployAmount ?? 0.3,
+    autoBlacklistOnCriticalDecay: u.copyTradingAutoBlacklistOnCriticalDecay ?? false,
+    autoBlacklistScoreBelow: u.copyTradingAutoBlacklistScoreBelow ?? 20,
+  },
 };
 
 /**

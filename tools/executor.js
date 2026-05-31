@@ -27,6 +27,7 @@ import { getWeightProfile, getAvailableModes } from "../scoring/weight-profiles.
 import { fuseWalletData, fuseMultipleWallets, getTopPerformerCandidates, getProviderStatus } from "../intelligence/fusion-layer.js";
 import { runAllocation } from "../allocation/allocation-engine.js";
 import { analyzePositionForCopy } from "../decision/analysis-engine.js";
+import { runCopyEngineCycle, getCopySignals } from "../copy-engine/position-monitor.js";
 import { config, reloadScreeningThresholds, MIN_SAFE_BINS_BELOW } from "../config.js";
 import { planDlmmEntry } from "../strategy/dlmm-edge.js";
 import { getRecentDecisions } from "../decision-log.js";
@@ -492,6 +493,14 @@ const toolMap = {
     return {
       ...selection,
       formatted: formatSelection(selection),
+    };
+  },
+  run_copy_engine: async ({ count, mode, force_ranking }) => {
+    return await runCopyEngineCycle({ count, mode, forceRanking: !!force_ranking, dryRun: config.copyTrading?.dryRun !== false });
+  },
+  get_copy_signals: async ({ limit, action } = {}) => {
+    return {
+      signals: getCopySignals({ limit: limit || 10, action: action || null }),
     };
   },
   update_config: ({ changes, reason = "" }) => {

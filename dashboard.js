@@ -34,6 +34,7 @@ const PATHS = {
   aiUsage: path.join(BOT_DIR, "data", "ai_usage.json"),
   aiProviderAlert: path.join(BOT_DIR, "data", "ai_provider_alert.json"),
   rankingDb: path.join(BOT_DIR, "ranking-db.json"),
+  copySignals: path.join(BOT_DIR, "copy-signals.json"),
 };
 
 // ── CORS ──────────────────────────────────────────────────────────────────────
@@ -634,6 +635,20 @@ app.get("/api/ranking", (req, res) => {
     } : null,
     walletsTracked: Object.keys(db.wallets || {}).length,
     history: (db.rankingHistory || []).slice(-20).reverse(),
+    ts: new Date().toISOString(),
+  });
+});
+
+app.get("/api/copy-signals", (req, res) => {
+  const data = readJSON(PATHS.copySignals, { signals: [], ignored: [], meta: {} });
+  const limit = Math.max(1, Math.min(100, parseInt(req.query.limit || "30", 10) || 30));
+  res.json({
+    ok: true,
+    meta: data.meta || {},
+    signals: (data.signals || []).slice().reverse().slice(0, limit),
+    ignored: (data.ignored || []).slice().reverse().slice(0, limit),
+    totalSignals: (data.signals || []).length,
+    totalIgnored: (data.ignored || []).length,
     ts: new Date().toISOString(),
   });
 });
